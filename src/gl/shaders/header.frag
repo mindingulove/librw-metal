@@ -34,14 +34,15 @@ layout(location = 1) out vec4 velOut;
 FSIN vec4 v_posCur;
 FSIN vec4 v_posPrev;
 uniform float u_velOn;
+float groundMark = 0.0;	// 1: level ground that applies the traced shadow itself (see DoWet)
 void WriteVel(void)
 {
 	vec2 a = v_posCur.xy/v_posCur.w;
 	vec2 b = v_posPrev.xy/v_posPrev.w;
 #ifdef PED_MARK
-	velOut = vec4((a - b)*0.5, 0.0, u_velOn*2.0);	// 2 = character
+	velOut = vec4((a - b)*0.5, groundMark, u_velOn*2.0);	// 2 = character
 #else
-	velOut = vec4((a - b)*0.5, 0.0, u_velOn);
+	velOut = vec4((a - b)*0.5, groundMark, u_velOn);
 #endif
 }
 #define WRITE_VEL() WriteVel()
@@ -59,6 +60,8 @@ uniform float u_roadPuddles;	// 1: rain puddles on, 0: only the faint wet film
 uniform sampler2DRect u_rtPrev;	// last frame's ray traced reflections (screen space)
 uniform vec2 u_rtSize;
 uniform vec2 u_rtParams;	// x: reflections available, y: strength
+uniform sampler2DRect u_shadowPrev;	// last frame's traced sun shadows (same size as the reflection image)
+uniform vec2 u_shadowParams;	// x: shadows available, y: strength
 layout(location = 2) out vec4 reflOut;
 float wetWeight = 0.0;
 
@@ -92,6 +95,20 @@ void DoWet(inout vec4 color)
 	// the colour of this layer's texture.
 	float surface = up;
 	float wetAmount = v_rw*surface;
+	groundMark = up > 0.5 ? 1.0 : 0.0;
+	// Level ground takes the traced sun shadow here, in its own shader, from last frame's image (exact for static ground).
+	// Shadow and puddle then combine inside one shader instead of two screen passes fighting over the same pixels: the
+	// shadow darkens the ground, the puddle mirror is mixed over it afterwards and is not darkened.
+	if(groundMark > 0.5 && u_shadowParams.x > 0.5 && v_posPrev.w > 0.0){
+		vec2 spu = (v_posPrev.xy/v_posPrev.w)*0.5 + 0.5;
+		if(spu.x > 0.0 && spu.x < 1.0 && spu.y > 0.0 && spu.y < 1.0){
+			vec2 stc = spu*u_rtSize;
+			float sh = texture(u_shadowPrev, stc).r*0.4
+			         + texture(u_shadowPrev, stc + vec2(1.5, 0.0)).r*0.15 + texture(u_shadowPrev, stc - vec2(1.5, 0.0)).r*0.15
+			         + texture(u_shadowPrev, stc + vec2(0.0, 1.5)).r*0.15 + texture(u_shadowPrev, stc - vec2(0.0, 1.5)).r*0.15;
+			color.rgb *= 1.0 - clamp(sh*u_shadowParams.y, 0.0, 1.0);
+		}
+	}
 	if(wetAmount > 0.001){
 		float n = puddleNoise(v_rpos.xy*0.22)*0.65 + puddleNoise(v_rpos.xy*0.9)*0.35;
 		float puddle = smoothstep(0.56, 0.72, n)*smoothstep(0.25, 0.6, clamp(wetAmount*1.4, 0.0, 1.0))*u_roadPuddles;
