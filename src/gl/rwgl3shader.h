@@ -55,7 +55,7 @@ struct Shader
 	int32 numUniforms;	// just to be sure!
 
 	// writes per-object motion vectors (fragment shader calls WRITE_VEL)
-	bool velocity, reflection;
+	bool velocity, reflection, wetKind, zeroKind;
 	GLint velLoc[4], roadLoc, puddleLoc, rtLoc[5];
 	int32 velFrame, velObj, velScene;
 
@@ -68,7 +68,7 @@ struct Shader
 
 extern Shader *currentShader;
 
-void velocityShaderSelected(bool v, bool refl);
+void velocityShaderSelected(bool v, bool refl, int kind);
 void uploadVelocityUniforms(Shader *s);
 
 }

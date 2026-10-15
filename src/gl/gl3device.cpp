@@ -258,6 +258,7 @@ static bool gScaledFrame = true;	// currently drawing into the reduced-size targ
 // re3.ini [Graphics] RenderTemporal=1: sub-pixel camera jitter + temporal accumulation (upscaler / anti-aliasing)
 static bool gTemporal = false;
 static GLuint rsFbo, rsVelTex, rsReflTex;	// reduced-size scene target, motion vector attachment, reflection direction attachment
+static int gVelKind;			// 0 car shader, 1 wet ground shader, 2 shader that only clears the reflection mark
 static int gVelWant = 1, gVelBoth = 1;	// draw buffers the selected shader wants (1 colour, 2 +motion, 3 +reflection) / enabled
 static float gRTStrength = 0.85f, gRTDistance = 250.0f;
 static bool gRT = false;
@@ -353,7 +354,12 @@ applyVelBuffers(void)
 {
 	if(!rsVelTex || currentFramebuffer != rsFbo) return;
 	int want = gVelWant;
-	if(want > 2 && (!rtWantsRefl() || !rsReflTex)) want = 2;
+	// reflection marks are only written when somebody reads them: cars need them for ray traced reflections, ground and the
+	// shaders that clear marks only while the ground is wet
+	if(want > 2){
+		bool needed = gVelKind == 0 ? gRT : rtWetRoads();
+		if(!needed || !rsReflTex) want = 2;
+	}
 	if(want == 2 && !gTemporal) want = 1;		// motion vectors only matter for the temporal upscaler
 	if(want == gVelBoth) return;
 	static const GLenum bufs[3] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2 };
@@ -1132,9 +1138,10 @@ setWorldMatrix(Matrix *mat)
 }
 
 void
-velocityShaderSelected(bool v, bool refl)
+velocityShaderSelected(bool v, bool refl, int kind)
 {
 	gVelWant = refl ? 3 : v ? 2 : 1;
+	gVelKind = kind;
 	applyVelBuffers();
 }
 
@@ -1426,7 +1433,7 @@ rsEnsureTargets(Raster *fbuf)
 		if(gNeedVel){
 			if(rsReflTex == 0) glGenTextures(1, &rsReflTex);
 			glBindTexture(GL_TEXTURE_2D, rsReflTex);
-			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, w, h, 0, GL_RGBA, GL_HALF_FLOAT, nil);
+			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nil);	// 8 bits per channel instead of 16: half the memory traffic
 			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -2226,7 +2233,7 @@ static const char *rsRTPrepSrc =
 "	for(int x = 0; x < div; x++){\n"
 "		ivec2 q = clamp(base + ivec2(x, y), ivec2(0), hi);\n"
 "		vec4 d = texelFetch(reflTex, q, 0);\n"
-"		if(d.w > best.w){ best = d; bp = q; }\n"
+"		if(d.w > best.w){ best = vec4(d.xyz*2.0 - 1.0, d.w); bp = q; }	// 8 bit direction: *2-1\n"
 "	}\n"
 "	oDepth = vec4(texelFetch(depthTex, bp, 0).r, 0.0, 0.0, 1.0);\n"
 "	oDir = best;\n"

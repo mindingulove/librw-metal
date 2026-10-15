@@ -279,9 +279,12 @@ Shader::create(const char **vsrc, const char **fsrc)
 	Shader *sh = rwNewT(Shader, 1, MEMDUR_EVENT | ID_DRIVER);	 // or global?
 	sh->velocity = false;
 	sh->reflection = false;
+	sh->wetKind = sh->zeroKind = false;
 	for(const char **p = fsrc; p && *p; p++){
 		if(strstr(*p, "#define VEL_PIPE")) sh->velocity = true;
 		if(strstr(*p, "#define REFL_OUT")) sh->reflection = true;
+		if(strstr(*p, "#define WET_SURFACE")) sh->wetKind = true;
+		if(strstr(*p, "#define ZERO_REFL")) sh->zeroKind = true;
 	}
 	sh->velLoc[0] = sh->velLoc[1] = sh->velLoc[2] = sh->velLoc[3] = -2;
 	sh->roadLoc = -1;
@@ -355,7 +358,7 @@ Shader::create(const char **vsrc, const char **fsrc)
 void
 Shader::use(void)
 {
-	velocityShaderSelected(this->velocity, this->reflection);
+	velocityShaderSelected(this->velocity, this->reflection, this->wetKind ? 1 : this->zeroKind ? 2 : 0);
 	if(currentShader != this){
 		glUseProgram(this->program);
 		currentShader = this;

@@ -124,7 +124,7 @@ void DoWet(inout vec4 color)
 	}
 }
 #define WET_FS(color) DoWet(color)
-#define WRITE_REFL() (reflOut = vec4(normalize(v_rrefl), wetWeight))
+#define WRITE_REFL() (reflOut = vec4(normalize(v_rrefl)*0.5 + 0.5, clamp(wetWeight, 0.0, 1.0)))	// 8 bit: direction*0.5+0.5, weight
 #elif defined(ZERO_REFL)
 // shaders of things that are not wet ground (characters, other materials) clear the reflection weight under them
 layout(location = 2) out vec4 reflOut;
