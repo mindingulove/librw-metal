@@ -2758,6 +2758,9 @@ regtaSceneCapture(unsigned *colorTex, unsigned *depthTex, float *texSize, float 
 {
 	if(!gSSR || !gUseTarget || !rsFbo || !rsCamera || rw::engine->currentCamera != rsCamera || !gScaledFrame)
 		return 0;
+	// ray traced car reflections replace the screen space ones: skip the per-car scene copies and the ray march in the shader
+	if(gRT && !rsRTFailed && mrtReady())
+		return 0;
 	if(!capTaken){
 		if(capW != rsW || capH != rsH || !capFbo)
 			capMakeTargets(rsW, rsH);
