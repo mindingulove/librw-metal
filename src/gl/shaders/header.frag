@@ -87,7 +87,10 @@ void DoWet(inout vec4 color)
 	vec3 faceN = normalize(cross(dFdx(v_rrel), dFdy(v_rrel)));
 	// only truly level ground: on bumpy ground the per-triangle normal changes from face to face and puddles would flicker
 	float up = smoothstep(0.93, 0.985, abs(faceN.z));
-	float surface = up*(1.0 - smoothstep(0.30, 0.55, (mx - mn)/max(mx, 0.01)))*(1.0 - smoothstep(0.6, 0.9, mx));
+	// The map has several overlapping ground layers (road, pavement, terrain underneath) that fight for the same pixels far
+	// away. Every layer must decide the same way, so the test depends only on the position and level of the surface, never on
+	// the colour of this layer's texture.
+	float surface = up;
 	float wetAmount = v_rw*surface;
 	if(wetAmount > 0.001){
 		float n = puddleNoise(v_rpos.xy*0.22)*0.65 + puddleNoise(v_rpos.xy*0.9)*0.35;
