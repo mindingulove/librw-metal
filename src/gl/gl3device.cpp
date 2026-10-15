@@ -284,9 +284,10 @@ static std::unordered_map<const void*, VelEntry> gVelMap;
 extern "C" { int8_t regtaGfxScaleIdx, regtaGfxTemporal, regtaGfxMetalFX, regtaGfxSSR, regtaGfxRT, regtaGfxRTRoads, regtaGfxRTShadows, regtaGfxPuddles = 1; }
 static const float kScaleTable[6] = { 1.0f, 0.9f, 0.8f, 0.75f, 0.67f, 0.5f };
 // frame cost of the extra graphics passes (milliseconds, smoothed): ray tracing, MetalFX, whole upscale/resolve step
-static float gPerfMs[3];
+static float gPerfMs[4];
+static double gCollectAcc;	// time spent registering geometry with the ray tracer this frame
 static inline double perfNow(void){ return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
-extern "C" void regtaPerfGet(float *ms){ ms[0] = gPerfMs[0]; ms[1] = gPerfMs[1]; ms[2] = gPerfMs[2]; }
+extern "C" void regtaPerfGet(float *ms){ ms[0] = gPerfMs[0]; ms[1] = gPerfMs[1]; ms[2] = gPerfMs[2]; ms[3] = gPerfMs[3]; }
 static bool gMetalFX = false;		// re3.ini [Graphics] RenderMetalFX=1: MetalFX temporal scaler instead of the GLSL resolve
 static float gMfxJitterSignX = 1.0f, gMfxJitterSignY = 1.0f;
 static bool gSSR = false;		// vehicles may sample a copy of the scene (screen space reflections)
@@ -2098,6 +2099,7 @@ rtTextureColour(Texture *tex, float *rgb)
 void
 rtCollect(Atomic *atomic, InstanceDataHeader*)
 {
+	struct Timer { double t0; Timer(){ t0 = perfNow(); } ~Timer(){ gCollectAcc += perfNow() - t0; } } timer;
 	if(!rtActive() || !gScaledFrame || !rsCamera || engine->currentCamera != rsCamera) return;
 	if(gRTLastFrame != (uint32)gFrameIdx){
 		gRTLastFrame = (uint32)gFrameIdx;
@@ -2899,6 +2901,8 @@ showRaster(Raster *raster, uint32 flags)
 	}
 	glfwSwapBuffers(glGlobals.window);
 	gScaledFrame = true;
+	gPerfMs[3] += ((float)gCollectAcc - gPerfMs[3])*0.05f;
+	gCollectAcc = 0.0;
 	capTaken = false;
 	capCount = 0;
 	if(gJitterApplied) memcpy(gPrevVP, gCurVP, sizeof(gPrevVP));
