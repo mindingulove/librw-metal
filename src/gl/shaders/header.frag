@@ -77,18 +77,24 @@ void DoWet(inout vec4 color)
 	float mx = max(color.r, max(color.g, color.b)), mn = min(color.r, min(color.g, color.b));
 	// face normal from the screen space derivatives of the world position (the map's models carry no normals)
 	vec3 faceN = normalize(cross(dFdx(v_rpos), dFdy(v_rpos)));
-	float up = smoothstep(0.85, 0.95, abs(faceN.z));
+	// only truly level ground: on bumpy ground the per-triangle normal changes from face to face and puddles would flicker
+	float up = smoothstep(0.93, 0.985, abs(faceN.z));
 	float surface = up*(1.0 - smoothstep(0.30, 0.55, (mx - mn)/max(mx, 0.01)))*(1.0 - smoothstep(0.6, 0.9, mx));
 	float wetAmount = v_rw*surface;
 	if(wetAmount > 0.001){
 		float n = puddleNoise(v_rpos.xy*0.22)*0.65 + puddleNoise(v_rpos.xy*0.9)*0.35;
-		float puddle = smoothstep(0.55, 0.62, n)*smoothstep(0.25, 0.6, clamp(wetAmount*1.4, 0.0, 1.0))*u_roadPuddles;
-		wetWeight = wetAmount*mix(0.12, 0.9, v_rfres)*0.5 + puddle*1.4;
+		float puddle = smoothstep(0.56, 0.72, n)*smoothstep(0.25, 0.6, clamp(wetAmount*1.4, 0.0, 1.0))*u_roadPuddles;
+		wetWeight = wetAmount*mix(0.12, 0.9, v_rfres)*0.5 + puddle*0.95;
 		color.rgb *= 1.0 - 0.35*puddle;
 	}
 }
 #define WET_FS(color) DoWet(color)
 #define WRITE_REFL() (reflOut = vec4(normalize(v_rrefl), wetWeight))
+#elif defined(ZERO_REFL)
+// shaders of things that are not wet ground (characters, other materials) clear the reflection weight under them
+layout(location = 2) out vec4 reflOut;
+#define WET_FS(color)
+#define WRITE_REFL() (reflOut = vec4(0.0))
 #else
 #define WET_FS(color)
 #define WRITE_REFL()

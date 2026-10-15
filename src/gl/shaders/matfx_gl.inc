@@ -66,6 +66,7 @@ const char *matfx_env_frag_src =
 "	DoAlphaTest(color.a);\n"
 
 "	WRITE_VEL();\n"
+"	WRITE_REFL();\n"
 "	FRAGCOLOR(color);\n"
 "}\n"
 ;

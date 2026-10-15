@@ -202,8 +202,8 @@ matfxOpen(void *o, int32, int32)
 #include "shaders/matfx_gl.inc"
 	const char *vs[] = { shaderDecl, "#define VEL_PIPE\n", header_vert_src, matfx_env_vert_src, nil };
 	const char *vs_fullLight[] = { shaderDecl, "#define VEL_PIPE\n", "#define DIRECTIONALS\n#define POINTLIGHTS\n#define SPOTLIGHTS\n", header_vert_src, matfx_env_vert_src, nil };
-	const char *fs[] = { shaderDecl, "#define VEL_PIPE\n", header_frag_src, matfx_env_frag_src, nil };
-	const char *fs_noAT[] = { shaderDecl, "#define VEL_PIPE\n", "#define NO_ALPHATEST\n", header_frag_src, matfx_env_frag_src, nil };
+	const char *fs[] = { shaderDecl, "#define VEL_PIPE\n", "#define REFL_OUT\n", "#define ZERO_REFL\n", header_frag_src, matfx_env_frag_src, nil };
+	const char *fs_noAT[] = { shaderDecl, "#define VEL_PIPE\n", "#define REFL_OUT\n", "#define ZERO_REFL\n", "#define NO_ALPHATEST\n", header_frag_src, matfx_env_frag_src, nil };
 
 	envShader = Shader::create(vs, fs);
 	assert(envShader);

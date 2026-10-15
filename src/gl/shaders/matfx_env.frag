@@ -31,5 +31,6 @@ main(void)
 	DoAlphaTest(color.a);
 
 	WRITE_VEL();
+	WRITE_REFL();
 	FRAGCOLOR(color);
 }

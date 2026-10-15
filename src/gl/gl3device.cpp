@@ -2188,8 +2188,10 @@ static const char *rsRTCompositeSrc =
 "	ivec2 p = ivec2(gl_FragCoord.xy);\n"
 "	float w = texelFetch(reflTex, p, 0).a;\n"
 "	if(w <= 0.001) discard;\n"
-"	vec4 r = texelFetch(rtTex, p);\n"
-"	fragColor = vec4(r.rgb, clamp(w*strength, 0.0, 1.0));\n"
+"	// soften the traced image a little (ripples, and the reflected colours are only per-material averages)\n"
+"	vec4 r = texelFetch(rtTex, p)*0.36;\n"
+"	r += texelFetch(rtTex, p + ivec2(2, 0))*0.16 + texelFetch(rtTex, p - ivec2(2, 0))*0.16;\n"
+"	r += texelFetch(rtTex, p + ivec2(0, 2))*0.16 + texelFetch(rtTex, p - ivec2(0, 2))*0.16;\n""	fragColor = vec4(r.rgb, clamp(w*strength, 0.0, 1.0));\n"
 "}\n";
 
 static const char *rsRTShadowSrc =
