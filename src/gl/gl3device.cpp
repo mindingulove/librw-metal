@@ -268,6 +268,8 @@ static int gVelObj, gSceneSerial;
 static float gVelPrevWorld[16];
 static float gVelOn;
 static bool gRTRoadsOn = true;
+static GLuint gRTOutTex;				// last traced reflection image (rectangle texture), read by the ground shaders next frame
+static int gRTOutW, gRTOutH;
 static float gRoadWet, gVelRoadWet, gRTRoadStrength = 0.7f;
 // which ray traced effects are wanted right now: car reflections, shadows and wet road reflections work on their own
 static inline bool rtWetRoads(void){ return gRTRoadsOn && gRoadWet > 0.05f; }
@@ -1143,10 +1145,16 @@ uploadVelocityUniforms(Shader *s)
 		s->velLoc[3] = glGetUniformLocation(s->program, "u_velOn");
 		s->roadLoc = glGetUniformLocation(s->program, "u_roadWet");
 		s->puddleLoc = glGetUniformLocation(s->program, "u_roadPuddles");
+		s->rtLoc[0] = glGetUniformLocation(s->program, "u_rtPrev");
+		s->rtLoc[1] = glGetUniformLocation(s->program, "u_rtSize");
+		s->rtLoc[2] = glGetUniformLocation(s->program, "u_rtParams");
 	}
 	if(s->velFrame != gFrameIdx || s->velScene != gSceneSerial){
 		if(s->velLoc[0] >= 0) glUniformMatrix4fv(s->velLoc[0], 1, GL_FALSE, gCurVP);
 		if(s->velLoc[1] >= 0) glUniformMatrix4fv(s->velLoc[1], 1, GL_FALSE, gPrevVP);
+		if(s->rtLoc[0] >= 0) glUniform1i(s->rtLoc[0], 6);
+		if(s->rtLoc[1] >= 0) glUniform2f(s->rtLoc[1], (float)gRTOutW, (float)gRTOutH);
+		if(s->rtLoc[2] >= 0) glUniform2f(s->rtLoc[2], (gRTOutTex && rtWantsRefl() && gRoadWet > 0.05f) ? 1.0f : 0.0f, gRTStrength);
 		s->velFrame = gFrameIdx;
 		s->velScene = gSceneSerial;
 	}
@@ -2228,7 +2236,8 @@ static const char *rsRTCompositeSrc =
 "void main(){\n"
 "	ivec2 p = ivec2(gl_FragCoord.xy);\n"
 "	float w = texelFetch(reflTex, p, 0).a;\n"
-"	if(texelFetch(velTex, p, 0).a > 1.5) discard;	// characters never get a reflection laid over them\n"
+"	float velA = texelFetch(velTex, p, 0).a;\n"
+"	if(velA > 1.5 || velA < 0.5) discard;	// only cars: characters never get one, the ground takes its own reflection in its shader\n"
 "	if(w <= 0.001) discard;\n"
 "	// soften the traced image a little (ripples, and the reflected colours are only per-material averages)\n"
 "	// the traced image is smaller than the screen: sample it with bilinear filtering (smooth, no blocks)\n"
@@ -2302,6 +2311,7 @@ rsRayTracePass(void)
 			if(!rsRTPrepProg || !rsRTCompProg || !rsRTShadowProg){ rsRTLog("shader compile failed, ray tracing off"); rsRTFailed = true; return; }
 		}
 		gRTGeom.clear();
+		gRTOutTex = 0;
 		if(!mrtSetup((rsW + gRTDiv - 1)/gRTDiv, (rsH + gRTDiv - 1)/gRTDiv, rsRTTex)){ rsRTLog("setup failed, ray tracing off"); rsRTFailed = true; return; }
 		{
 			GLint prevRect;
@@ -2323,6 +2333,8 @@ rsRayTracePass(void)
 		glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
 		if(st != GL_FRAMEBUFFER_COMPLETE){ rsRTLog("input framebuffer incomplete, ray tracing off"); mrtShutdown(); rsRTFailed = true; return; }
 		rsRTSize[0] = rsW; rsRTSize[1] = rsH;
+		gRTOutTex = rsRTTex[2];
+		gRTOutW = (rsW + gRTDiv - 1)/gRTDiv; gRTOutH = (rsH + gRTDiv - 1)/gRTDiv;
 		return;	// geometry is registered from now on; first traced frame is the next one
 	}
 	Gl3Raster *natzb = PLUGINOFFSET(Gl3Raster, rsCamera->zBuffer->parent, nativeRasterOffset);
@@ -2646,6 +2658,14 @@ beginUpdate(Camera *cam)
 {
 	float view[16], proj[16];
 	syncGfxSettings();
+	if(gRTOutTex){
+		// last frame's traced reflections for the ground shaders (unit 6 is not used by anything else)
+		GLint prevActive;
+		glGetIntegerv(GL_ACTIVE_TEXTURE, &prevActive);
+		glActiveTexture(GL_TEXTURE6);
+		glBindTexture(GL_TEXTURE_RECTANGLE, gRTOutTex);
+		glActiveTexture(prevActive);
+	}
 	// View Matrix
 	Matrix inv;
 	Matrix::invert(&inv, cam->getFrame()->getLTM());

@@ -56,7 +56,7 @@ struct Shader
 
 	// writes per-object motion vectors (fragment shader calls WRITE_VEL)
 	bool velocity, reflection;
-	GLint velLoc[4], roadLoc, puddleLoc;
+	GLint velLoc[4], roadLoc, puddleLoc, rtLoc[3];
 	int32 velFrame, velObj, velScene;
 
 	static Shader *create(const char **vsrc, const char **fsrc);

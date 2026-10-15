@@ -55,6 +55,9 @@ FSIN float v_rw;
 FSIN float v_rfres;
 FSIN vec3 v_rpos;
 uniform float u_roadPuddles;	// 1: rain puddles on, 0: only the faint wet film
+uniform sampler2DRect u_rtPrev;	// last frame's ray traced reflections (screen space)
+uniform vec2 u_rtSize;
+uniform vec2 u_rtParams;	// x: reflections available, y: strength
 layout(location = 2) out vec4 reflOut;
 float wetWeight = 0.0;
 
@@ -90,6 +93,15 @@ void DoWet(inout vec4 color)
 		float puddle = smoothstep(0.56, 0.72, n)*smoothstep(0.25, 0.6, clamp(wetAmount*1.4, 0.0, 1.0))*u_roadPuddles;
 		wetWeight = wetAmount*mix(0.12, 0.9, v_rfres)*0.5 + puddle*0.95;
 		color.rgb *= 1.0 - 0.15*puddle;
+		// the reflection belongs to the ground itself: look it up where this point was last frame (the ground is static, so
+		// that is exact) and mix it into the ground colour. Characters and cars drawn later simply cover it.
+		if(u_rtParams.x > 0.5 && v_posPrev.w > 0.0){
+			vec2 pu = (v_posPrev.xy/v_posPrev.w)*0.5 + 0.5;
+			if(pu.x > 0.0 && pu.x < 1.0 && pu.y > 0.0 && pu.y < 1.0){
+				vec4 r = texture(u_rtPrev, pu*u_rtSize);
+				color.rgb = mix(color.rgb, r.rgb, clamp(wetWeight*u_rtParams.y, 0.0, 1.0)*r.a);
+			}
+		}
 	}
 }
 #define WET_FS(color) DoWet(color)
