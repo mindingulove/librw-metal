@@ -146,6 +146,7 @@ VSOUT vec3 v_rrefl;
 VSOUT float v_rw;
 VSOUT float v_rfres;
 VSOUT vec3 v_rpos;
+VSOUT vec3 v_rrel;	// position relative to the camera: small numbers, so the surface orientation from derivatives stays exact far away
 void WetSetup(vec4 wpos)
 {
 	vec3 wetEye = -(transpose(mat3(u_view))*u_view[3].xyz);
@@ -154,6 +155,7 @@ void WetSetup(vec4 wpos)
 	v_rfres = pow(1.0 - clamp(wetV.z, 0.0, 1.0), 4.0);
 	v_rw = u_roadWet;
 	v_rpos = wpos.xyz;
+	v_rrel = wpos.xyz - wetEye;
 }
 #define WET_VS(wpos) WetSetup(wpos)
 #else

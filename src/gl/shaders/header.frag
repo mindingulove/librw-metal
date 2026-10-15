@@ -54,6 +54,7 @@ FSIN vec3 v_rrefl;
 FSIN float v_rw;
 FSIN float v_rfres;
 FSIN vec3 v_rpos;
+FSIN vec3 v_rrel;
 uniform float u_roadPuddles;	// 1: rain puddles on, 0: only the faint wet film
 uniform sampler2DRect u_rtPrev;	// last frame's ray traced reflections (screen space)
 uniform vec2 u_rtSize;
@@ -83,7 +84,7 @@ void DoWet(inout vec4 color)
 	wetWeight = 0.0;
 	float mx = max(color.r, max(color.g, color.b)), mn = min(color.r, min(color.g, color.b));
 	// face normal from the screen space derivatives of the world position (the map's models carry no normals)
-	vec3 faceN = normalize(cross(dFdx(v_rpos), dFdy(v_rpos)));
+	vec3 faceN = normalize(cross(dFdx(v_rrel), dFdy(v_rrel)));
 	// only truly level ground: on bumpy ground the per-triangle normal changes from face to face and puddles would flicker
 	float up = smoothstep(0.93, 0.985, abs(faceN.z));
 	float surface = up*(1.0 - smoothstep(0.30, 0.55, (mx - mn)/max(mx, 0.01)))*(1.0 - smoothstep(0.6, 0.9, mx));
@@ -99,7 +100,8 @@ void DoWet(inout vec4 color)
 			vec2 pu = (v_posPrev.xy/v_posPrev.w)*0.5 + 0.5;
 			if(pu.x > 0.0 && pu.x < 1.0 && pu.y > 0.0 && pu.y < 1.0){
 				vec4 r = texture(u_rtPrev, pu*u_rtSize);
-				color.rgb = mix(color.rgb, r.rgb, clamp(wetWeight*u_rtParams.y, 0.0, 1.0)*r.a);
+				// the filtered image holds colour*coverage in rgb and coverage in a: undo that so edges fade instead of flicker
+				color.rgb = mix(color.rgb, r.rgb/max(r.a, 0.001), clamp(wetWeight*u_rtParams.y, 0.0, 1.0)*smoothstep(0.0, 0.6, r.a));
 			}
 		}
 	}
