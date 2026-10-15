@@ -4,6 +4,11 @@ const char *simple_frag_src =
 "FSIN vec4 v_color;\n"
 "FSIN vec2 v_tex0;\n"
 "FSIN float v_fog;\n"
+"#ifdef REFL_OUT\n"
+"FSIN vec3 v_rrefl;\n"
+"FSIN float v_rw;\n"
+"layout(location = 2) out vec4 reflOut;\n"
+"#endif\n"
 
 "void\n"
 "main(void)\n"
@@ -12,6 +17,9 @@ const char *simple_frag_src =
 "	color.rgb = mix(u_fogColor.rgb, color.rgb, v_fog);\n"
 "	DoAlphaTest(color.a);\n"
 "	WRITE_VEL();\n"
+"#ifdef REFL_OUT\n"
+"	reflOut = vec4(normalize(v_rrefl), v_rw);\n"
+"#endif\n"
 "	FRAGCOLOR(color);\n"
 "}\n"
 ;
