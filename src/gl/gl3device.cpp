@@ -2153,8 +2153,12 @@ rtCollect(Atomic *atomic, InstanceDataHeader*)
 			// that receive them, so rays hit them by accident and leave large dark patches. Skip flat meshes and meshes that are
 			// mostly horizontal, upward facing surface.
 			const V3d *vert = g->morphTargets[0].vertices;
-			float zmin = 1e30f, zmax = -1e30f, areaAll = 0.0f, areaUp = 0.0f;
-			for(int v = 0; v < g->numVertices; v++){ if(vert[v].z < zmin) zmin = vert[v].z; if(vert[v].z > zmax) zmax = vert[v].z; }
+			float zmin = 1e30f, zmax = -1e30f, xmin = 1e30f, xmax = -1e30f, ymin = 1e30f, ymax = -1e30f, areaAll = 0.0f, areaUp = 0.0f;
+			for(int v = 0; v < g->numVertices; v++){
+				if(vert[v].z < zmin) zmin = vert[v].z; if(vert[v].z > zmax) zmax = vert[v].z;
+				if(vert[v].x < xmin) xmin = vert[v].x; if(vert[v].x > xmax) xmax = vert[v].x;
+				if(vert[v].y < ymin) ymin = vert[v].y; if(vert[v].y > ymax) ymax = vert[v].y;
+			}
 			for(uint32 m = 0; m < mh->numMeshes; m++){
 				const std::vector<uint32_t> &L = lists[m];
 				for(size_t i = 0; i + 2 < L.size(); i += 3){
@@ -2166,7 +2170,11 @@ rtCollect(Atomic *atomic, InstanceDataHeader*)
 					if(len > 0.0f && fabsf(nz)/len > 0.7f) areaUp += len;
 				}
 			}
-			if(zmax - zmin < 0.35f || (areaAll > 0.0f && areaUp/areaAll > 0.6f)) groundLike = true;
+			// ground: flat meshes, mostly upward facing meshes, and wide low meshes with a good share of upward facing surface
+			// (terrain, embankments): their triangles share a plane with the road and shadow rays hit them by accident
+			float height = zmax - zmin, extent = fmaxf(xmax - xmin, ymax - ymin);
+			float upShare = areaAll > 0.0f ? areaUp/areaAll : 0.0f;
+			if(height < 0.35f || upShare > 0.5f || (upShare > 0.25f && height < 0.12f*extent)) groundLike = true;
 		}
 		if(groundLike) for(auto &c : meshCasts) c = 0;
 		if(bad){
