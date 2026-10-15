@@ -102,7 +102,11 @@ void DoWet(inout vec4 color)
 		if(u_rtParams.x > 0.5 && v_posPrev.w > 0.0){
 			vec2 pu = (v_posPrev.xy/v_posPrev.w)*0.5 + 0.5;
 			if(pu.x > 0.0 && pu.x < 1.0 && pu.y > 0.0 && pu.y < 1.0){
-				vec4 r = texture(u_rtPrev, pu*u_rtSize);
+				vec2 tc = pu*u_rtSize;
+				// five bilinear taps: the facade pattern seen in the reflection changes with every angle, soften it
+				vec4 r = texture(u_rtPrev, tc)*0.4
+				       + texture(u_rtPrev, tc + vec2(1.5, 0.0))*0.15 + texture(u_rtPrev, tc - vec2(1.5, 0.0))*0.15
+				       + texture(u_rtPrev, tc + vec2(0.0, 1.5))*0.15 + texture(u_rtPrev, tc - vec2(0.0, 1.5))*0.15;
 				// the filtered image holds colour*coverage in rgb and coverage in a: undo that so edges fade instead of flicker
 				color.rgb = mix(color.rgb, r.rgb/max(r.a, 0.001), clamp(wetWeight*u_rtParams.y, 0.0, 1.0)*smoothstep(0.0, 0.6, r.a));
 			}
