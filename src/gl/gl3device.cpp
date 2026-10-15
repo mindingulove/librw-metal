@@ -297,6 +297,8 @@ static inline bool sceneQueriesUsable(void){ return glGenQueries && glBeginQuery
 static double gCollectAcc;	// time spent registering geometry with the ray tracer this frame
 static inline double perfNow(void){ return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 extern "C" void regtaPerfGet(float *ms){ ms[0] = gPerfMs[0]; ms[1] = gPerfMs[1]; ms[2] = gPerfMs[2]; ms[3] = gPerfMs[3]; ms[4] = gPerfMs[4]; ms[5] = gPerfMs[5]; }
+extern "C" int regtaEnableGLMultithreading(void);
+static int gGLMultithread = 1;	// re3.ini [Graphics] GLMultithread=0 turns Apple's multithreaded GL engine off
 static bool gMetalFX = false;		// re3.ini [Graphics] RenderMetalFX=1: MetalFX temporal scaler instead of the GLSL resolve
 static float gMfxJitterSignX = 1.0f, gMfxJitterSignY = 1.0f;
 static bool gSSR = false;		// vehicles may sample a copy of the scene (screen space reflections)
@@ -3580,6 +3582,8 @@ startGLFW(void)
 					gRTRoadStrength = (float)atof(line + 21);
 				else if(inGraphics && strncmp(line, "RenderRTDistance=", 17) == 0)
 					gRTDistance = (float)atof(line + 17);
+				else if(inGraphics && strncmp(line, "GLMultithread=", 14) == 0)
+					gGLMultithread = atoi(line + 14);
 				else if(inGraphics && strncmp(line, "RenderMetalFX=", 14) == 0)
 					gMetalFX = atoi(line + 14) != 0;
 				else if(inGraphics && strncmp(line, "MetalFXJitterFlipX=", 19) == 0)
@@ -3667,6 +3671,9 @@ startGLFW(void)
 	}
 
 	printf("OpenGL version: %s (%s)\n", glGetString(GL_VERSION), glGetString(GL_RENDERER));
+#ifdef __APPLE__
+	if(gGLMultithread) regtaEnableGLMultithreading();
+#endif
 
 	glGlobals.window = win;
 	*glGlobals.pWindow = win;
