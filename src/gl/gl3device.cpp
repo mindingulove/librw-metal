@@ -3,6 +3,7 @@
 #include <string.h>
 #include <assert.h>
 #include <unordered_map>
+#include <chrono>
 #include <vector>
 #include <array>
 
@@ -274,6 +275,10 @@ static std::unordered_map<const void*, VelEntry> gVelMap;
 extern "C" { int8_t regtaGfxScaleIdx, regtaGfxTemporal, regtaGfxMetalFX, regtaGfxSSR, regtaGfxRT, regtaGfxRTRoads, regtaGfxRTShadows, regtaGfxPuddles = 1; }
 static const float kScaleTable[6] = { 1.0f, 0.9f, 0.8f, 0.75f, 0.67f, 0.5f };
 static bool gRTRoadsOn = true;
+// frame cost of the extra graphics passes (milliseconds, smoothed): ray tracing, MetalFX, whole upscale/resolve step
+static float gPerfMs[3];
+static inline double perfNow(void){ return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+extern "C" void regtaPerfGet(float *ms){ ms[0] = gPerfMs[0]; ms[1] = gPerfMs[1]; ms[2] = gPerfMs[2]; }
 static bool gMetalFX = false;		// re3.ini [Graphics] RenderMetalFX=1: MetalFX temporal scaler instead of the GLSL resolve
 static float gMfxJitterSignX = 1.0f, gMfxJitterSignY = 1.0f;
 static bool gSSR = false;		// vehicles may sample a copy of the scene (screen space reflections)
@@ -1095,7 +1100,8 @@ setWorldMatrix(Matrix *mat)
 
 	// previous-frame world matrix of moving objects (for motion vectors)
 	gVelObj++;
-	gVelRoadWet = (regtaRoadDraw && gRTRoadsOn) ? gRoadWet*gRTRoadStrength : 0.0f;
+	// everything static can get wet: the shader picks the upward facing grey surfaces (roads, pavements)
+	gVelRoadWet = (!regtaVelocityDynamic && gRTRoadsOn) ? gRoadWet*gRTRoadStrength : 0.0f;
 	if((gTemporal || gRT) && gUseTarget && regtaVelocityDynamic){
 		if(gVelMap.size() > 30000) gVelMap.clear();
 		VelEntry &e = gVelMap[mat];
@@ -2327,6 +2333,7 @@ resolveRenderScale(void)
 {
 	if(!gUseTarget || !gScaledFrame || !rsFbo || !rsCamera) return;
 	gScaledFrame = false;
+	double resolveT0 = perfNow();
 	if(!rsEasuProg){
 		rsEasuProg = rsCompile(rsVertSrc, rsEasuSrc);
 		rsRcasProg = rsCompile(rsVertSrc, rsRcasSrc);
@@ -2367,12 +2374,19 @@ resolveRenderScale(void)
 	glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 	glBindVertexArray(rsVao);
 
-	rsRayTracePass();
+	{
+		double t0 = perfNow();
+		rsRayTracePass();
+		gPerfMs[0] += ((float)(perfNow() - t0) - gPerfMs[0])*0.05f;
+	}
 
 	GLuint sharpenSrc = rsUpTex;
 	GLint prevTex1 = 0, prevTex2 = 0, prevTex3 = 0;
 	bool temporal = gTemporal && gJitterApplied && rsTemporalProg && rsHistTex[0] && rsVelTex && rsCamera->zBuffer;
-	if(temporal && gMetalFX && rsMetalFXPass()){
+	double mfxT0 = perfNow();
+	bool mfxDone = temporal && gMetalFX && rsMetalFXPass();
+	gPerfMs[1] += ((mfxDone ? (float)(perfNow() - mfxT0) : 0.0f) - gPerfMs[1])*0.05f;
+	if(mfxDone){
 		gHistValid = true;
 		sharpenSrc = rsHistTex[rsHistCur];
 	}else if(temporal){
@@ -2451,6 +2465,7 @@ resolveRenderScale(void)
 	currentFramebuffer = 0;
 	glGlobals.presentWidth = 0;
 	setViewport(rsCamera->frameBuffer);
+	gPerfMs[2] += ((float)(perfNow() - resolveT0) - gPerfMs[2])*0.05f;
 }
 
 extern "C" void regtaResolveRenderScale(void) { resolveRenderScale(); }

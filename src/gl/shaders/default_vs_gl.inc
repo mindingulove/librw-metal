@@ -10,7 +10,8 @@ const char *default_vert_src =
 "VSOUT vec3 v_rrefl;\n"
 "VSOUT float v_rw;		// road wetness (0 for everything but roads)\n"
 "VSOUT float v_rfres;	// fresnel term of the viewing angle\n"
-"VSOUT vec2 v_rpos;	// world position, for the puddle pattern\n"
+"VSOUT vec2 v_rpos;\n"
+"VSOUT float v_rup;	// how horizontal / upward facing the surface is (0..1)	// world position, for the puddle pattern\n"
 "#endif\n"
 
 "void\n"
@@ -27,6 +28,7 @@ const char *default_vert_src =
 "		v_rfres = pow(1.0 - clamp(V.z, 0.0, 1.0), 4.0);\n"
 "		v_rw = u_roadWet;\n"
 "		v_rpos = Vertex.xy;\n"
+"		v_rup = clamp((normalize(mat3(u_world)*in_normal).z - 0.85)/0.1, 0.0, 1.0);\n"
 "	}\n"
 "#endif\n"
 "	vec3 Normal = mat3(u_world) * in_normal;\n"

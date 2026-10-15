@@ -9,7 +9,8 @@ uniform float u_roadWet;
 VSOUT vec3 v_rrefl;
 VSOUT float v_rw;		// road wetness (0 for everything but roads)
 VSOUT float v_rfres;	// fresnel term of the viewing angle
-VSOUT vec2 v_rpos;	// world position, for the puddle pattern
+VSOUT vec2 v_rpos;
+VSOUT float v_rup;	// how horizontal / upward facing the surface is (0..1)	// world position, for the puddle pattern
 #endif
 
 void
@@ -26,6 +27,7 @@ main(void)
 		v_rfres = pow(1.0 - clamp(V.z, 0.0, 1.0), 4.0);
 		v_rw = u_roadWet;
 		v_rpos = Vertex.xy;
+		v_rup = clamp((normalize(mat3(u_world)*in_normal).z - 0.85)/0.1, 0.0, 1.0);
 	}
 #endif
 	vec3 Normal = mat3(u_world) * in_normal;
