@@ -244,6 +244,65 @@ static GlState curGlState, oldGlState;
 static int32 activeTexture;
 static uint32 boundTexture[MAXNUMSTAGES];
 
+// re3.ini [Graphics] RenderScale (0.5-1.0): the 3D scene is drawn at this fraction of the window's
+// pixel size and upscaled (FSR 1 style) before the HUD is drawn
+static float gRenderScale = 1.0f;
+static bool gScaledFrame = true;	// currently drawing into the reduced-size target
+// re3.ini [Graphics] RenderTemporal=1: sub-pixel camera jitter + temporal accumulation (upscaler / anti-aliasing)
+static bool gTemporal = false;
+static bool gUseTarget = false;		// 3D scene goes through the offscreen target (render scale < 1 or temporal)
+static float gJit[2];			// current jitter in target pixels
+static int gFrameIdx;
+static bool gJitterApplied;		// the main camera was jittered this frame
+static bool gHistValid;
+static float gCurVP[16], gPrevVP[16], gInvVP[16];
+
+static void
+mat4mul(float *r, const float *a, const float *b)	// column-major r = a*b
+{
+	for(int c = 0; c < 4; c++)
+		for(int rw = 0; rw < 4; rw++){
+			float v = 0;
+			for(int k = 0; k < 4; k++) v += a[k*4+rw]*b[c*4+k];
+			r[c*4+rw] = v;
+		}
+}
+
+static bool
+mat4inv(float *out, const float *m)
+{
+	float inv[16];
+	inv[0] = m[5]*m[10]*m[15]-m[5]*m[11]*m[14]-m[9]*m[6]*m[15]+m[9]*m[7]*m[14]+m[13]*m[6]*m[11]-m[13]*m[7]*m[10];
+	inv[4] = -m[4]*m[10]*m[15]+m[4]*m[11]*m[14]+m[8]*m[6]*m[15]-m[8]*m[7]*m[14]-m[12]*m[6]*m[11]+m[12]*m[7]*m[10];
+	inv[8] = m[4]*m[9]*m[15]-m[4]*m[11]*m[13]-m[8]*m[5]*m[15]+m[8]*m[7]*m[13]+m[12]*m[5]*m[11]-m[12]*m[7]*m[9];
+	inv[12] = -m[4]*m[9]*m[14]+m[4]*m[10]*m[13]+m[8]*m[5]*m[14]-m[8]*m[6]*m[13]-m[12]*m[5]*m[10]+m[12]*m[6]*m[9];
+	inv[1] = -m[1]*m[10]*m[15]+m[1]*m[11]*m[14]+m[9]*m[2]*m[15]-m[9]*m[3]*m[14]-m[13]*m[2]*m[11]+m[13]*m[3]*m[10];
+	inv[5] = m[0]*m[10]*m[15]-m[0]*m[11]*m[14]-m[8]*m[2]*m[15]+m[8]*m[3]*m[14]+m[12]*m[2]*m[11]-m[12]*m[3]*m[10];
+	inv[9] = -m[0]*m[9]*m[15]+m[0]*m[11]*m[13]+m[8]*m[1]*m[15]-m[8]*m[3]*m[13]-m[12]*m[1]*m[11]+m[12]*m[3]*m[9];
+	inv[13] = m[0]*m[9]*m[14]-m[0]*m[10]*m[13]-m[8]*m[1]*m[14]+m[8]*m[2]*m[13]+m[12]*m[1]*m[10]-m[12]*m[2]*m[9];
+	inv[2] = m[1]*m[6]*m[15]-m[1]*m[7]*m[14]-m[5]*m[2]*m[15]+m[5]*m[3]*m[14]+m[13]*m[2]*m[7]-m[13]*m[3]*m[6];
+	inv[6] = -m[0]*m[6]*m[15]+m[0]*m[7]*m[14]+m[4]*m[2]*m[15]-m[4]*m[3]*m[14]-m[12]*m[2]*m[7]+m[12]*m[3]*m[6];
+	inv[10] = m[0]*m[5]*m[15]-m[0]*m[7]*m[13]-m[4]*m[1]*m[15]+m[4]*m[3]*m[13]+m[12]*m[1]*m[7]-m[12]*m[3]*m[5];
+	inv[14] = -m[0]*m[5]*m[14]+m[0]*m[6]*m[13]+m[4]*m[1]*m[14]-m[4]*m[2]*m[13]-m[12]*m[1]*m[6]+m[12]*m[2]*m[5];
+	inv[3] = -m[1]*m[6]*m[11]+m[1]*m[7]*m[10]+m[5]*m[2]*m[11]-m[5]*m[3]*m[10]-m[9]*m[2]*m[7]+m[9]*m[3]*m[6];
+	inv[7] = m[0]*m[6]*m[11]-m[0]*m[7]*m[10]-m[4]*m[2]*m[11]+m[4]*m[3]*m[10]+m[8]*m[2]*m[7]-m[8]*m[3]*m[6];
+	inv[11] = -m[0]*m[5]*m[11]+m[0]*m[7]*m[9]+m[4]*m[1]*m[11]-m[4]*m[3]*m[9]-m[8]*m[1]*m[7]+m[8]*m[3]*m[5];
+	inv[15] = m[0]*m[5]*m[10]-m[0]*m[6]*m[9]-m[4]*m[1]*m[10]+m[4]*m[2]*m[9]+m[8]*m[1]*m[6]-m[8]*m[2]*m[5];
+	float det = m[0]*inv[0] + m[1]*inv[4] + m[2]*inv[8] + m[3]*inv[12];
+	if(det == 0.0f) return false;
+	det = 1.0f/det;
+	for(int i = 0; i < 16; i++) out[i] = inv[i]*det;
+	return true;
+}
+
+static float
+halton(int i, int b)
+{
+	float f = 1.0f, r = 0.0f;
+	while(i > 0){ f /= b; r += f*(i % b); i /= b; }
+	return r;
+}
+
 static uint32 currentFramebuffer;
 
 static uint32 blendMap[] = {
@@ -1193,6 +1252,62 @@ flushCache(void)
 	flushUniforms();
 }
 
+// ---- render scale: reduced-size colour target for the 3D scene, resolved by an FSR 1 style pass ----
+static GLuint rsFbo, rsTex, rsUpFbo, rsUpTex;
+static GLuint rsHistFbo[2], rsHistTex[2];
+static int rsHistCur;
+static int rsW, rsH, rsOutW, rsOutH;
+static Camera *rsCamera;
+
+static void
+rsMakeTex(GLuint *fbo, GLuint *tex, int w, int h)
+{
+	if(*tex == 0) glGenTextures(1, tex);
+	glBindTexture(GL_TEXTURE_2D, *tex);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nil);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	if(*fbo == 0) glGenFramebuffers(1, fbo);
+	glBindFramebuffer(GL_FRAMEBUFFER, *fbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, *tex, 0);
+}
+
+// (re)creates the targets when the window size changed; leaves bindings to the caller
+static void
+rsEnsureTargets(Raster *fbuf)
+{
+	float sc = getHidpiScale();
+	int w = (int)(fbuf->width*sc + .5f), h = (int)(fbuf->height*sc + .5f);
+	int fw = 0, fh = 0;
+	glfwGetFramebufferSize(glGlobals.window, &fw, &fh);
+	if(rsFbo && w == rsW && h == rsH && fw == rsOutW && fh == rsOutH) return;
+	GLint prevTex, prevFbo;
+	glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex);
+	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
+	rsMakeTex(&rsFbo, &rsTex, w, h);
+	rsMakeTex(&rsUpFbo, &rsUpTex, fw, fh);
+	if(gTemporal){
+		for(int i = 0; i < 2; i++){
+			if(rsHistTex[i] == 0) glGenTextures(1, &rsHistTex[i]);
+			glBindTexture(GL_TEXTURE_2D, rsHistTex[i]);
+			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, fw, fh, 0, GL_RGBA, GL_HALF_FLOAT, nil);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+			if(rsHistFbo[i] == 0) glGenFramebuffers(1, &rsHistFbo[i]);
+			glBindFramebuffer(GL_FRAMEBUFFER, rsHistFbo[i]);
+			glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, rsHistTex[i], 0);
+		}
+		gHistValid = false;
+	}
+	glBindTexture(GL_TEXTURE_2D, prevTex);
+	glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
+	rsW = w; rsH = h; rsOutW = fw; rsOutH = fh;
+}
+
 static void
 setFrameBuffer(Camera *cam)
 {
@@ -1203,6 +1318,15 @@ setFrameBuffer(Camera *cam)
 	Gl3Raster *natfb = PLUGINOFFSET(Gl3Raster, fbuf, nativeRasterOffset);
 	Gl3Raster *natzb = PLUGINOFFSET(Gl3Raster, zbuf, nativeRasterOffset);
 	assert(fbuf->type == Raster::CAMERA || fbuf->type == Raster::CAMERATEXTURE);
+
+	if(gUseTarget && fbuf->type == Raster::CAMERA){
+		rsCamera = cam;
+		if(gScaledFrame){
+			rsEnsureTargets(fbuf);
+			natfb->fbo = rsFbo;
+		}else
+			natfb->fbo = 0;
+	}
 
 	// Have to make sure depth buffer is attached to FB's fbo
 	bindFramebuffer(natfb->fbo);
@@ -1238,8 +1362,8 @@ setFrameBuffer(Camera *cam)
 	}
 }
 
-float
-getHidpiScale(void)
+static float
+nativeHidpiScale(void)
 {
 #ifdef LIBRW_GLFW
 	if(glGlobals.window){
@@ -1253,10 +1377,16 @@ getHidpiScale(void)
 }
 
 float
+getHidpiScale(void)
+{
+	return nativeHidpiScale() * gRenderScale;
+}
+
+float
 hidpiScaleFor(int32 w, int32 h)
 {
 	float s = getHidpiScale();
-	if(s <= 1.0f) return 1.0f;
+	if(s == 1.0f) return 1.0f;
 #ifdef LIBRW_GLFW
 	int ww = 0, wh = 0;
 	glfwGetWindowSize(glGlobals.window, &ww, &wh);
@@ -1277,12 +1407,16 @@ getFramebufferRect(Raster *frameBuffer)
 		SDL_GetWindowSize(glGlobals.window, &r.w, &r.h);
 #elif defined(LIBRW_GLFW)
 		glfwGetFramebufferSize(glGlobals.window, &r.w, &r.h);
+		if(gUseTarget && gScaledFrame){
+			r.w = (int32)(r.w * gRenderScale + 0.5f);
+			r.h = (int32)(r.h * gRenderScale + 0.5f);
+		}
 #else
 		missing implementation
 #endif
 	}else{
 		float tsc = PLUGINOFFSET(Gl3Raster, fb, nativeRasterOffset)->scale;
-		if(tsc < 1.0f) tsc = 1.0f;
+		if(tsc <= 0.0f) tsc = 1.0f;
 		r.w = (int32)(fb->width * tsc + 0.5f);
 		r.h = (int32)(fb->height * tsc + 0.5f);
 	}
@@ -1296,7 +1430,7 @@ getFramebufferRect(Raster *frameBuffer)
 		float sx = 1.0f, sy = 1.0f;
 		if(fb->type != Raster::CAMERA){
 			float tsc = PLUGINOFFSET(Gl3Raster, fb, nativeRasterOffset)->scale;
-			if(tsc > 1.0f) sx = sy = tsc;
+			if(tsc > 0.0f) sx = sy = tsc;
 		}
 #ifdef LIBRW_GLFW
 		if(fb->type == Raster::CAMERA){
@@ -1332,6 +1466,356 @@ setViewport(Raster *frameBuffer)
 		glGlobals.presentOffY = r.y;
 	}
 }
+
+// FSR 1 style upscaler: edge adaptive spatial upsampling (12 taps, directional Lanczos-like kernel)
+// followed by robust contrast adaptive sharpening
+static const char *rsVertSrc =
+"#version 330\n"
+"out vec2 uv;\n"
+"void main(){\n"
+"	vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);\n"
+"	uv = p;\n"
+"	gl_Position = vec4(p*2.0-1.0, 0.0, 1.0);\n"
+"}\n";
+
+static const char *rsEasuSrc =
+"#version 330\n"
+"uniform sampler2D tex;\n"
+"uniform vec2 inSize;\n"
+"uniform vec2 outSize;\n"
+"in vec2 uv;\n"
+"out vec4 fragColor;\n"
+"vec3 fetch(ivec2 p){ return texelFetch(tex, clamp(p, ivec2(0), ivec2(inSize)-1), 0).rgb; }\n"
+"float lum(vec3 c){ return c.b*0.5 + (c.r*0.5 + c.g); }\n"
+"void easuSet(inout vec2 dir, inout float len, vec2 pp, bool biS, bool biT, bool biU, bool biV,\n"
+"             float lA, float lB, float lC, float lD, float lE){\n"
+"	float w = 0.0;\n"
+"	if(biS) w = (1.0-pp.x)*(1.0-pp.y);\n"
+"	if(biT) w = pp.x*(1.0-pp.y);\n"
+"	if(biU) w = (1.0-pp.x)*pp.y;\n"
+"	if(biV) w = pp.x*pp.y;\n"
+"	float dc = lD-lC, cb = lC-lB;\n"
+"	float lenX = max(abs(dc), abs(cb));\n"
+"	lenX = lenX > 0.0 ? 1.0/lenX : 0.0;\n"
+"	float dirX = lD-lB;\n"
+"	dir.x += dirX*w;\n"
+"	lenX = clamp(abs(dirX)*lenX, 0.0, 1.0);\n"
+"	lenX *= lenX;\n"
+"	len += lenX*w;\n"
+"	float ec = lE-lC, ca = lC-lA;\n"
+"	float lenY = max(abs(ec), abs(ca));\n"
+"	lenY = lenY > 0.0 ? 1.0/lenY : 0.0;\n"
+"	float dirY = lE-lA;\n"
+"	dir.y += dirY*w;\n"
+"	lenY = clamp(abs(dirY)*lenY, 0.0, 1.0);\n"
+"	lenY *= lenY;\n"
+"	len += lenY*w;\n"
+"}\n"
+"void easuTap(inout vec3 aC, inout float aW, vec2 off, vec2 dir, vec2 len, float lob, float clp, vec3 c){\n"
+"	vec2 v = vec2(off.x*dir.x + off.y*dir.y, off.x*(-dir.y) + off.y*dir.x);\n"
+"	v *= len;\n"
+"	float d2 = min(v.x*v.x + v.y*v.y, clp);\n"
+"	float wB = 2.0/5.0*d2 - 1.0;\n"
+"	float wA = lob*d2 - 1.0;\n"
+"	wB *= wB; wA *= wA;\n"
+"	wB = 25.0/16.0*wB - (25.0/16.0 - 1.0);\n"
+"	float w = wB*wA;\n"
+"	aC += c*w; aW += w;\n"
+"}\n"
+"void main(){\n"
+"	vec2 outPix = uv*outSize;\n"
+"	vec2 pp = outPix*(inSize/outSize) - 0.5;\n"
+"	vec2 fp = floor(pp);\n"
+"	pp -= fp;\n"
+"	ivec2 ip = ivec2(fp);\n"
+"	vec3 b = fetch(ip+ivec2(0,-1)), c = fetch(ip+ivec2(1,-1));\n"
+"	vec3 e = fetch(ip+ivec2(-1,0)), f = fetch(ip), g = fetch(ip+ivec2(1,0)), h = fetch(ip+ivec2(2,0));\n"
+"	vec3 i = fetch(ip+ivec2(-1,1)), j = fetch(ip+ivec2(0,1)), k = fetch(ip+ivec2(1,1)), l = fetch(ip+ivec2(2,1));\n"
+"	vec3 n = fetch(ip+ivec2(0,2)), o = fetch(ip+ivec2(1,2));\n"
+"	float bL=lum(b), cL=lum(c), eL=lum(e), fL=lum(f), gL=lum(g), hL=lum(h);\n"
+"	float iL=lum(i), jL=lum(j), kL=lum(k), lL=lum(l), nL=lum(n), oL=lum(o);\n"
+"	vec2 dir = vec2(0.0); float len = 0.0;\n"
+"	easuSet(dir, len, pp, true,false,false,false, bL,eL,fL,gL,jL);\n"
+"	easuSet(dir, len, pp, false,true,false,false, cL,fL,gL,hL,kL);\n"
+"	easuSet(dir, len, pp, false,false,true,false, fL,iL,jL,kL,nL);\n"
+"	easuSet(dir, len, pp, false,false,false,true, gL,jL,kL,lL,oL);\n"
+"	float dir2 = dir.x*dir.x + dir.y*dir.y;\n"
+"	bool zro = dir2 < (1.0/32768.0);\n"
+"	dir2 = inversesqrt(max(dir2, 1.0/32768.0));\n"
+"	dir2 = zro ? 1.0 : dir2;\n"
+"	dir.x = zro ? 1.0 : dir.x;\n"
+"	dir *= dir2;\n"
+"	len = len*0.5; len *= len;\n"
+"	float stretch = (dir.x*dir.x + dir.y*dir.y) / max(abs(dir.x), abs(dir.y));\n"
+"	vec2 len2 = vec2(1.0 + (stretch-1.0)*len, 1.0 - 0.5*len);\n"
+"	float lob = 0.5 + ((1.0/4.0 - 0.04) - 0.5)*len;\n"
+"	float clp = 1.0/lob;\n"
+"	vec3 aC = vec3(0.0); float aW = 0.0;\n"
+"	easuTap(aC,aW, vec2( 0,-1)-pp, dir,len2,lob,clp, b);\n"
+"	easuTap(aC,aW, vec2( 1,-1)-pp, dir,len2,lob,clp, c);\n"
+"	easuTap(aC,aW, vec2(-1, 1)-pp, dir,len2,lob,clp, i);\n"
+"	easuTap(aC,aW, vec2( 0, 1)-pp, dir,len2,lob,clp, j);\n"
+"	easuTap(aC,aW, vec2( 0, 0)-pp, dir,len2,lob,clp, f);\n"
+"	easuTap(aC,aW, vec2(-1, 0)-pp, dir,len2,lob,clp, e);\n"
+"	easuTap(aC,aW, vec2( 1, 1)-pp, dir,len2,lob,clp, k);\n"
+"	easuTap(aC,aW, vec2( 2, 1)-pp, dir,len2,lob,clp, l);\n"
+"	easuTap(aC,aW, vec2( 2, 0)-pp, dir,len2,lob,clp, h);\n"
+"	easuTap(aC,aW, vec2( 1, 0)-pp, dir,len2,lob,clp, g);\n"
+"	easuTap(aC,aW, vec2( 1, 2)-pp, dir,len2,lob,clp, o);\n"
+"	easuTap(aC,aW, vec2( 0, 2)-pp, dir,len2,lob,clp, n);\n"
+"	vec3 res = aC/aW;\n"
+"	vec3 mn = min(min(f,g), min(j,k)), mx = max(max(f,g), max(j,k));\n"
+"	fragColor = vec4(clamp(res, mn, mx), 1.0);\n"
+"}\n";
+
+static const char *rsRcasSrc =
+"#version 330\n"
+"uniform sampler2D tex;\n"
+"uniform float sharp;\n"
+"in vec2 uv;\n"
+"out vec4 fragColor;\n"
+"void main(){\n"
+"	ivec2 sz = textureSize(tex, 0);\n"
+"	ivec2 p = ivec2(uv*vec2(sz));\n"
+"	vec3 b = texelFetch(tex, clamp(p+ivec2(0,-1), ivec2(0), sz-1), 0).rgb;\n"
+"	vec3 d = texelFetch(tex, clamp(p+ivec2(-1,0), ivec2(0), sz-1), 0).rgb;\n"
+"	vec3 e = texelFetch(tex, clamp(p, ivec2(0), sz-1), 0).rgb;\n"
+"	vec3 f = texelFetch(tex, clamp(p+ivec2(1,0), ivec2(0), sz-1), 0).rgb;\n"
+"	vec3 h = texelFetch(tex, clamp(p+ivec2(0,1), ivec2(0), sz-1), 0).rgb;\n"
+"	float bL = b.b*0.5 + (b.r*0.5 + b.g), dL = d.b*0.5 + (d.r*0.5 + d.g), eL = e.b*0.5 + (e.r*0.5 + e.g);\n"
+"	float fL = f.b*0.5 + (f.r*0.5 + f.g), hL = h.b*0.5 + (h.r*0.5 + h.g);\n"
+"	float nz = 0.25*(bL+dL+fL+hL) - eL;\n"
+"	nz = clamp(abs(nz) / (max(max(bL,dL), max(eL, max(fL,hL))) - min(min(bL,dL), min(eL, min(fL,hL))) + 1e-5), 0.0, 1.0);\n"
+"	nz = -0.5*nz + 1.0;\n"
+"	vec3 mn4 = min(min(b,d), min(f,h)), mx4 = max(max(b,d), max(f,h));\n"
+"	vec3 hitMin = min(mn4, e) / (4.0*mx4 + 1e-5);\n"
+"	vec3 hitMax = (vec3(1.0) - max(mx4, e)) / (4.0*mn4 - vec3(4.0) + 1e-5);\n"
+"	vec3 lobeRGB = max(-hitMin, hitMax);\n"
+"	float lobe = max(-0.1875, min(max(lobeRGB.r, max(lobeRGB.g, lobeRGB.b)), 0.0)) * exp2(-sharp);\n"
+"	lobe *= nz;\n"
+"	float rcpL = 1.0/(4.0*lobe + 1.0);\n"
+"	fragColor = vec4((lobe*(b+d+f+h) + e)*rcpL, 1.0);\n"
+"}\n";
+
+
+static const char *rsTemporalSrc =
+"#version 330\n"
+"uniform sampler2D colorTex;\n"
+"uniform sampler2D depthTex;\n"
+"uniform sampler2D histTex;\n"
+"uniform vec2 lowSize;\n"
+"uniform vec2 outSize;\n"
+"uniform vec2 jitter;\n"
+"uniform mat4 invVP;\n"
+"uniform mat4 prevVP;\n"
+"uniform float histValid;\n"
+"out vec4 fragColor;\n"
+"vec3 fetchC(ivec2 p){ return texelFetch(colorTex, clamp(p, ivec2(0), ivec2(lowSize)-1), 0).rgb; }\n"
+"float fetchD(ivec2 p){ return texelFetch(depthTex, clamp(p, ivec2(0), ivec2(lowSize)-1), 0).r; }\n"
+"vec3 sampleHist(vec2 uv){\n"
+"	// Catmull-Rom through 5 bilinear taps\n"
+"	vec2 pos = uv*outSize;\n"
+"	vec2 c = floor(pos - 0.5) + 0.5;\n"
+"	vec2 f = pos - c;\n"
+"	vec2 w0 = f*(-0.5 + f*(1.0 - 0.5*f));\n"
+"	vec2 w1 = 1.0 + f*f*(-2.5 + 1.5*f);\n"
+"	vec2 w2 = f*(0.5 + f*(2.0 - 1.5*f));\n"
+"	vec2 w3 = f*f*(-0.5 + 0.5*f);\n"
+"	vec2 w12 = w1 + w2;\n"
+"	vec2 t0 = (c - 1.0)/outSize, t3 = (c + 2.0)/outSize, t12 = (c + w2/w12)/outSize;\n"
+"	vec3 r = texture(histTex, vec2(t12.x, t0.y)).rgb*(w12.x*w0.y)\n"
+"	       + texture(histTex, vec2(t0.x, t12.y)).rgb*(w0.x*w12.y)\n"
+"	       + texture(histTex, vec2(t12.x, t12.y)).rgb*(w12.x*w12.y)\n"
+"	       + texture(histTex, vec2(t3.x, t12.y)).rgb*(w3.x*w12.y)\n"
+"	       + texture(histTex, vec2(t12.x, t3.y)).rgb*(w12.x*w3.y);\n"
+"	return max(r, vec3(0.0));\n"
+"}\n"
+"void main(){\n"
+"	vec2 outUV = gl_FragCoord.xy/outSize;\n"
+"	vec2 q = outUV*lowSize + jitter;\n"
+"	ivec2 ci = ivec2(floor(q));\n"
+"	vec3 sum = vec3(0.0), mn = vec3(1e4), mx = vec3(-1e4);\n"
+"	float wsum = 0.0, dmin = 1.0;\n"
+"	for(int y = -1; y <= 1; y++)\n"
+"	for(int x = -1; x <= 1; x++){\n"
+"		ivec2 t = ci + ivec2(x, y);\n"
+"		vec3 c = fetchC(t);\n"
+"		vec2 d = vec2(t) + 0.5 - q;\n"
+"		float w = exp(-2.3*dot(d, d));\n"
+"		sum += c*w; wsum += w;\n"
+"		mn = min(mn, c); mx = max(mx, c);\n"
+"		dmin = min(dmin, fetchD(t));\n"
+"	}\n"
+"	vec3 cur = sum/wsum;\n"
+"	vec4 wp = invVP*vec4(outUV*2.0-1.0, dmin*2.0-1.0, 1.0);\n"
+"	vec4 pc = prevVP*vec4(wp.xyz/wp.w, 1.0);\n"
+"	vec2 puv = pc.xy/pc.w*0.5 + 0.5;\n"
+"	bool ok = histValid > 0.5 && pc.w > 0.0 && all(greaterThan(puv, vec2(0.0))) && all(lessThan(puv, vec2(1.0)));\n"
+"	vec3 res = cur;\n"
+"	if(ok){\n"
+"		vec3 h = sampleHist(puv);\n"
+"		vec3 hc = clamp(h, mn - 0.01, mx + 0.01);\n"
+"		float a = clamp(0.1 + length(h - hc)*3.0, 0.1, 1.0);\n"
+"		res = mix(hc, cur, a);\n"
+"	}\n"
+"	fragColor = vec4(res, 1.0);\n"
+"}\n";
+
+static GLuint rsEasuProg, rsRcasProg, rsVao, rsTemporalProg;
+static float gRenderSharpness = 0.2f;	// RCAS sharpening in stops (0 = max, 2 = none)
+
+static GLuint
+rsCompile(const char *vs, const char *fs)
+{
+	GLuint prog = glCreateProgram();
+	GLuint sh[2];
+	const char *src[2] = { vs, fs };
+	GLenum ty[2] = { GL_VERTEX_SHADER, GL_FRAGMENT_SHADER };
+	for(int i = 0; i < 2; i++){
+		sh[i] = glCreateShader(ty[i]);
+		glShaderSource(sh[i], 1, &src[i], nil);
+		glCompileShader(sh[i]);
+		GLint ok = 0;
+		glGetShaderiv(sh[i], GL_COMPILE_STATUS, &ok);
+		if(!ok){
+			char log[1024];
+			glGetShaderInfoLog(sh[i], sizeof(log), nil, log);
+			fprintf(stderr, "render scale shader error: %s\n", log);
+			return 0;
+		}
+		glAttachShader(prog, sh[i]);
+	}
+	glLinkProgram(prog);
+	GLint ok = 0;
+	glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+	if(!ok){
+		fprintf(stderr, "render scale shader link failed\n");
+		return 0;
+	}
+	glDeleteShader(sh[0]);
+	glDeleteShader(sh[1]);
+	return prog;
+}
+
+// Upscales the reduced-size scene to the window. Called before the HUD is drawn (and by showRaster
+// when nobody did), everything drawn afterwards goes to the window at native resolution.
+static void
+resolveRenderScale(void)
+{
+	if(!gUseTarget || !gScaledFrame || !rsFbo || !rsCamera) return;
+	gScaledFrame = false;
+	if(!rsEasuProg){
+		rsEasuProg = rsCompile(rsVertSrc, rsEasuSrc);
+		rsRcasProg = rsCompile(rsVertSrc, rsRcasSrc);
+		if(gTemporal) rsTemporalProg = rsCompile(rsVertSrc, rsTemporalSrc);
+		glGenVertexArrays(1, &rsVao);
+	}
+	Gl3Raster *natfb = PLUGINOFFSET(Gl3Raster, rsCamera->frameBuffer->parent, nativeRasterOffset);
+	natfb->fbo = 0;
+	if(!rsEasuProg || !rsRcasProg){
+		// shaders unusable: plain blit
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, rsFbo);
+		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+		glBlitFramebuffer(0, 0, rsW, rsH, 0, 0, rsOutW, rsOutH, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+		bindFramebuffer(0);
+		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+		glGlobals.presentWidth = 0;
+		setViewport(rsCamera->frameBuffer);
+		return;
+	}
+
+	GLint prevVao, prevActive, prevTex0, prevProg;
+	glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &prevVao);
+	glGetIntegerv(GL_ACTIVE_TEXTURE, &prevActive);
+	glActiveTexture(GL_TEXTURE0);
+	glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex0);
+	glGetIntegerv(GL_CURRENT_PROGRAM, &prevProg);
+	GLboolean blend = glIsEnabled(GL_BLEND), depth = glIsEnabled(GL_DEPTH_TEST),
+	          cull = glIsEnabled(GL_CULL_FACE), scissor = glIsEnabled(GL_SCISSOR_TEST);
+	GLboolean cmask[4];
+	glGetBooleanv(GL_COLOR_WRITEMASK, cmask);
+	glDisable(GL_BLEND);
+	glDisable(GL_DEPTH_TEST);
+	glDisable(GL_CULL_FACE);
+	glDisable(GL_SCISSOR_TEST);
+	glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+	glBindVertexArray(rsVao);
+
+	GLuint sharpenSrc = rsUpTex;
+	GLint prevTex1 = 0, prevTex2 = 0;
+	bool temporal = gTemporal && gJitterApplied && rsTemporalProg && rsHistTex[0] && rsCamera->zBuffer;
+	if(temporal){
+		// pass 1: jittered samples + reprojected history -> new history
+		int cur = rsHistCur ^ 1;
+		Gl3Raster *natzb = PLUGINOFFSET(Gl3Raster, rsCamera->zBuffer->parent, nativeRasterOffset);
+		glBindFramebuffer(GL_FRAMEBUFFER, rsHistFbo[cur]);
+		glViewport(0, 0, rsOutW, rsOutH);
+		glUseProgram(rsTemporalProg);
+		glActiveTexture(GL_TEXTURE1);
+		glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex1);
+		glBindTexture(GL_TEXTURE_2D, natzb->texid);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+		glActiveTexture(GL_TEXTURE2);
+		glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex2);
+		glBindTexture(GL_TEXTURE_2D, rsHistTex[rsHistCur]);
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D, rsTex);
+		glUniform1i(glGetUniformLocation(rsTemporalProg, "colorTex"), 0);
+		glUniform1i(glGetUniformLocation(rsTemporalProg, "depthTex"), 1);
+		glUniform1i(glGetUniformLocation(rsTemporalProg, "histTex"), 2);
+		glUniform2f(glGetUniformLocation(rsTemporalProg, "lowSize"), (float)rsW, (float)rsH);
+		glUniform2f(glGetUniformLocation(rsTemporalProg, "outSize"), (float)rsOutW, (float)rsOutH);
+		glUniform2f(glGetUniformLocation(rsTemporalProg, "jitter"), gJit[0], gJit[1]);
+		glUniformMatrix4fv(glGetUniformLocation(rsTemporalProg, "invVP"), 1, GL_FALSE, gInvVP);
+		glUniformMatrix4fv(glGetUniformLocation(rsTemporalProg, "prevVP"), 1, GL_FALSE, gPrevVP);
+		glUniform1f(glGetUniformLocation(rsTemporalProg, "histValid"), gHistValid ? 1.0f : 0.0f);
+		glDrawArrays(GL_TRIANGLES, 0, 3);
+		glActiveTexture(GL_TEXTURE2);
+		glBindTexture(GL_TEXTURE_2D, prevTex2);
+		glActiveTexture(GL_TEXTURE1);
+		glBindTexture(GL_TEXTURE_2D, prevTex1);
+		glActiveTexture(GL_TEXTURE0);
+		rsHistCur = cur;
+		gHistValid = true;
+		sharpenSrc = rsHistTex[cur];
+	}else{
+		gHistValid = false;
+		// pass 1: edge adaptive upsampling into the native-size texture
+		glBindFramebuffer(GL_FRAMEBUFFER, rsUpFbo);
+		glViewport(0, 0, rsOutW, rsOutH);
+		glUseProgram(rsEasuProg);
+		glBindTexture(GL_TEXTURE_2D, rsTex);
+		glUniform1i(glGetUniformLocation(rsEasuProg, "tex"), 0);
+		glUniform2f(glGetUniformLocation(rsEasuProg, "inSize"), (float)rsW, (float)rsH);
+		glUniform2f(glGetUniformLocation(rsEasuProg, "outSize"), (float)rsOutW, (float)rsOutH);
+		glDrawArrays(GL_TRIANGLES, 0, 3);
+	}
+
+	// pass 2: sharpening into the window
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	glViewport(0, 0, rsOutW, rsOutH);
+	glUseProgram(rsRcasProg);
+	glBindTexture(GL_TEXTURE_2D, sharpenSrc);
+	glUniform1i(glGetUniformLocation(rsRcasProg, "tex"), 0);
+	glUniform1f(glGetUniformLocation(rsRcasProg, "sharp"), gRenderSharpness);
+	glDrawArrays(GL_TRIANGLES, 0, 3);
+
+	glBindVertexArray(prevVao);
+	glBindTexture(GL_TEXTURE_2D, prevTex0);
+	glActiveTexture(prevActive);
+	glUseProgram(prevProg);
+	if(blend) glEnable(GL_BLEND);
+	if(depth) glEnable(GL_DEPTH_TEST);
+	if(cull) glEnable(GL_CULL_FACE);
+	if(scissor) glEnable(GL_SCISSOR_TEST);
+	glColorMask(cmask[0], cmask[1], cmask[2], cmask[3]);
+	currentFramebuffer = 0;
+	glGlobals.presentWidth = 0;
+	setViewport(rsCamera->frameBuffer);
+}
+
+extern "C" void regtaResolveRenderScale(void) { resolveRenderScale(); }
 
 static void
 beginUpdate(Camera *cam)
@@ -1394,6 +1878,23 @@ beginUpdate(Camera *cam)
 		proj[15] = 1.0f;
 	}
 	memcpy(&cam->devProj, &proj, sizeof(RawMatrix));
+	if(gUseTarget && gTemporal && gScaledFrame && cam->frameBuffer->parent->type == Raster::CAMERA &&
+	   cam->projection == Camera::PERSPECTIVE){
+		// unjittered view-projection for reprojection
+		float vp[16];
+		mat4mul(vp, proj, view);
+		memcpy(gCurVP, vp, sizeof(vp));
+		if(mat4inv(gInvVP, vp)){
+			// sub-pixel jitter (Halton 2,3) of the projection, in target pixels
+			float sc = getHidpiScale();
+			float tw = cam->frameBuffer->parent->width*sc, th = cam->frameBuffer->parent->height*sc;
+			gJit[0] = halton(gFrameIdx % 16 + 1, 2) - 0.5f;
+			gJit[1] = halton(gFrameIdx % 16 + 1, 3) - 0.5f;
+			proj[8] += 2.0f*gJit[0]/tw;
+			proj[9] += 2.0f*gJit[1]/th;
+			gJitterApplied = true;
+		}
+	}
 	setProjectionMatrix(proj);
 
 	if(rwStateCache.fogStart != cam->fogPlane){
@@ -1456,6 +1957,7 @@ extern "C" int regtaDumpRequest;
 static void
 showRaster(Raster *raster, uint32 flags)
 {
+	resolveRenderScale();
 //	glViewport(raster->offsetX, raster->offsetY,
 //		raster->width, raster->height);
 
@@ -1536,6 +2038,11 @@ showRaster(Raster *raster, uint32 flags)
 		sinceSet = 0;
 	}
 	glfwSwapBuffers(glGlobals.window);
+	gScaledFrame = true;
+	if(gJitterApplied) memcpy(gPrevVP, gCurVP, sizeof(gPrevVP));
+	else gHistValid = false;
+	gJitterApplied = false;
+	gFrameIdx++;
 #else
 	not implemented
 #endif
@@ -1558,7 +2065,7 @@ rasterRenderFast(Raster *raster, int32 x, int32 y)
 			setActiveTexture(0);
 			glBindTexture(GL_TEXTURE_2D, natdst->texid);
 			{
-				float sc = natdst->scale < 1.0f ? 1.0f : natdst->scale;
+				float sc = natdst->scale <= 0.0f ? 1.0f : natdst->scale;
 				glCopyTexSubImage2D(GL_TEXTURE_2D, 0, (int32)(x*sc+.5f), (int32)(((dst->height-src->height)-y)*sc+.5f),
 					0, 0, (int32)(src->width*sc+.5f), (int32)(src->height*sc+.5f));
 			}
@@ -2007,6 +2514,24 @@ startGLFW(void)
 	mode = &glGlobals.modes[glGlobals.currentMode];
 
 	glfwSetErrorCallback(glfwerr);
+	{
+		if(FILE *ini = fopen("re3.ini", "r")){
+			char line[256];
+			bool inGraphics = false;
+			while(fgets(line, sizeof(line), ini)){
+				if(line[0] == '[') inGraphics = strncmp(line, "[Graphics]", 10) == 0;
+				else if(inGraphics && strncmp(line, "RenderScale=", 12) == 0){
+					float v = (float)atof(line + 12);
+					if(v >= 0.4f && v <= 1.0f) gRenderScale = v;
+				}else if(inGraphics && strncmp(line, "RenderSharpness=", 16) == 0)
+					gRenderSharpness = (float)atof(line + 16);
+				else if(inGraphics && strncmp(line, "RenderTemporal=", 15) == 0)
+					gTemporal = atoi(line + 15) != 0;
+			}
+			fclose(ini);
+		}
+		gUseTarget = gRenderScale < 1.0f || gTemporal;
+	}
 #ifdef __APPLE__
 	// The game sizes its framebuffer copies (post-processing, screen grabs) in window points.
 	// A 2x Retina framebuffer makes those copy only the lower-left quarter and stretch it
