@@ -2123,6 +2123,26 @@ rtCollect(Atomic *atomic, InstanceDataHeader*)
 			colours[m*3+1] = tc[1]*mc.green/255.0f;
 			colours[m*3+2] = tc[2]*mc.blue/255.0f;
 		}
+		if(!bad && casts){
+			// ground-like meshes (roads, pavements, grass, terrain) must not cast shadows: they lie on or just under the surfaces
+			// that receive them, so rays hit them by accident and leave large dark patches. Skip flat meshes and meshes that are
+			// mostly horizontal, upward facing surface.
+			const V3d *vert = g->morphTargets[0].vertices;
+			float zmin = 1e30f, zmax = -1e30f, areaAll = 0.0f, areaUp = 0.0f;
+			for(int v = 0; v < g->numVertices; v++){ if(vert[v].z < zmin) zmin = vert[v].z; if(vert[v].z > zmax) zmax = vert[v].z; }
+			for(uint32 m = 0; m < mh->numMeshes; m++){
+				const std::vector<uint32_t> &L = lists[m];
+				for(size_t i = 0; i + 2 < L.size(); i += 3){
+					V3d a = vert[L[i]], b = vert[L[i+1]], c = vert[L[i+2]];
+					float e1x = b.x-a.x, e1y = b.y-a.y, e1z = b.z-a.z, e2x = c.x-a.x, e2y = c.y-a.y, e2z = c.z-a.z;
+					float nx = e1y*e2z - e1z*e2y, ny = e1z*e2x - e1x*e2z, nz = e1x*e2y - e1y*e2x;
+					float len = sqrtf(nx*nx + ny*ny + nz*nz);
+					areaAll += len;
+					if(len > 0.0f && fabsf(nz)/len > 0.7f) areaUp += len;
+				}
+			}
+			if(zmax - zmin < 0.35f || (areaAll > 0.0f && areaUp/areaAll > 0.6f)) casts = false;
+		}
 		if(bad){
 			e.id = -1;
 		}else{
@@ -2165,11 +2185,32 @@ static const char *rsRTCompositeSrc =
 static const char *rsRTShadowSrc =
 "#version 330\n"
 "uniform sampler2DRect shadowTex;\n"
+"uniform sampler2DRect depthRect;\n"
 "uniform float strength;\n"
+"uniform vec2 nearFar;\n"
 "out vec4 fragColor;\n"
+"float lin(float d){\n"
+"	float z = d*2.0 - 1.0;\n"
+"	return 2.0*nearFar.x*nearFar.y/(nearFar.y + nearFar.x - z*(nearFar.y - nearFar.x));\n"
+"}\n"
 "void main(){\n"
-"	float s = texelFetch(shadowTex, ivec2(gl_FragCoord.xy)).r;\n"
-"	if(s <= 0.001) discard;\n"
+"	ivec2 p = ivec2(gl_FragCoord.xy);\n"
+"	ivec2 hi = textureSize(depthRect) - 1;\n"
+"	float dc = texelFetch(depthRect, p).r;\n"
+"	if(dc >= 0.99999) discard;\n"
+"	float lc = lin(dc);\n"
+"	// depth aware blur: the shadow rays are noisy (one ray per pixel), so smooth between pixels of the same surface\n"
+"	float sum = 0.0, ws = 0.0;\n"
+"	for(int y = -2; y <= 2; y++)\n"
+"	for(int x = -2; x <= 2; x++){\n"
+"		ivec2 q = clamp(p + ivec2(x, y), ivec2(0), hi);\n"
+"		float lq = lin(texelFetch(depthRect, q).r);\n"
+"		float w = exp(-float(x*x + y*y)*0.2)*exp(-abs(lq - lc)/(0.03*lc + 0.05));\n"
+"		sum += texelFetch(shadowTex, q).r*w;\n"
+"		ws += w;\n"
+"	}\n"
+"	float s = sum/max(ws, 1e-4);\n"
+"	if(s <= 0.004) discard;\n"
 "	fragColor = vec4(vec3(1.0 - s*strength), 1.0);\n"
 "}\n";
 
@@ -2261,7 +2302,12 @@ rsRayTracePass(void)
 			glUseProgram(rsRTShadowProg);
 			glActiveTexture(GL_TEXTURE0);
 			glBindTexture(GL_TEXTURE_RECTANGLE, rsRTTex[3]);
+			glActiveTexture(GL_TEXTURE1);
+			glBindTexture(GL_TEXTURE_RECTANGLE, rsRTTex[0]);
+			glActiveTexture(GL_TEXTURE0);
 			glUniform1i(glGetUniformLocation(rsRTShadowProg, "shadowTex"), 0);
+			glUniform1i(glGetUniformLocation(rsRTShadowProg, "depthRect"), 1);
+			glUniform2f(glGetUniformLocation(rsRTShadowProg, "nearFar"), rsCamera->nearPlane, rsCamera->farPlane);
 			glUniform1f(glGetUniformLocation(rsRTShadowProg, "strength"), gRTShadowStrength*gRTEnv.sunVisibility);
 			glBlendFunc(GL_ZERO, GL_SRC_COLOR);
 			glDrawArrays(GL_TRIANGLES, 0, 3);
@@ -2309,6 +2355,9 @@ resolveRenderScale(void)
 	          cull = glIsEnabled(GL_CULL_FACE), scissor = glIsEnabled(GL_SCISSOR_TEST);
 	GLboolean cmask[4];
 	glGetBooleanv(GL_COLOR_WRITEMASK, cmask);
+	GLint blendSrcRGB, blendDstRGB, blendSrcA, blendDstA;	// the passes below change the blend function: the HUD must find the game's
+	glGetIntegerv(GL_BLEND_SRC_RGB, &blendSrcRGB); glGetIntegerv(GL_BLEND_DST_RGB, &blendDstRGB);
+	glGetIntegerv(GL_BLEND_SRC_ALPHA, &blendSrcA); glGetIntegerv(GL_BLEND_DST_ALPHA, &blendDstA);
 	glDisable(GL_BLEND);
 	glDisable(GL_DEPTH_TEST);
 	glDisable(GL_CULL_FACE);
@@ -2391,6 +2440,7 @@ resolveRenderScale(void)
 	glBindTexture(GL_TEXTURE_2D, prevTex0);
 	glActiveTexture(prevActive);
 	glUseProgram(prevProg);
+	glBlendFuncSeparate(blendSrcRGB, blendDstRGB, blendSrcA, blendDstA);
 	if(blend) glEnable(GL_BLEND);
 	if(depth) glEnable(GL_DEPTH_TEST);
 	if(cull) glEnable(GL_CULL_FACE);
