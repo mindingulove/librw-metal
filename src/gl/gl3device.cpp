@@ -250,6 +250,7 @@ static float gRenderScale = 1.0f;
 static bool gScaledFrame = true;	// currently drawing into the reduced-size target
 // re3.ini [Graphics] RenderTemporal=1: sub-pixel camera jitter + temporal accumulation (upscaler / anti-aliasing)
 static bool gTemporal = false;
+static bool gSSR = false;		// vehicles may sample a copy of the scene (screen space reflections)
 static bool gUseTarget = false;		// 3D scene goes through the offscreen target (render scale < 1 or temporal)
 static float gJit[2];			// current jitter in target pixels
 static int gFrameIdx;
@@ -1817,6 +1818,70 @@ resolveRenderScale(void)
 
 extern "C" void regtaResolveRenderScale(void) { resolveRenderScale(); }
 
+
+// ---- scene capture for screen space reflections ----
+// A copy of the colour and depth rendered so far; taken the first time a vehicle is drawn in a frame.
+static GLuint capFbo, capColor, capDepth;
+static int capW, capH;
+static bool capTaken;
+
+static void
+capMakeTargets(int w, int h)
+{
+	GLint prevTex;
+	glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex);
+	if(!capFbo){
+		glGenFramebuffers(1, &capFbo);
+		glGenTextures(1, &capColor);
+		glGenTextures(1, &capDepth);
+	}
+	glBindTexture(GL_TEXTURE_2D, capColor);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nil);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glBindTexture(GL_TEXTURE_2D, capDepth);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, w, h, 0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, nil);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glBindTexture(GL_TEXTURE_2D, prevTex);
+	glBindFramebuffer(GL_FRAMEBUFFER, capFbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, capColor, 0);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, capDepth, 0);
+	capW = w; capH = h;
+}
+
+// Returns 1 and fills the info when a copy of the main scene is available.
+extern "C" int
+regtaSceneCapture(unsigned *colorTex, unsigned *depthTex, float *texSize, float *viewport, float *proj, float *view)
+{
+	if(!gSSR || !gUseTarget || !rsFbo || !rsCamera || rw::engine->currentCamera != rsCamera || !gScaledFrame)
+		return 0;
+	if(!capTaken){
+		if(capW != rsW || capH != rsH || !capFbo)
+			capMakeTargets(rsW, rsH);
+		GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
+		glDisable(GL_SCISSOR_TEST);
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, rsFbo);
+		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, capFbo);
+		glBlitFramebuffer(0, 0, rsW, rsH, 0, 0, rsW, rsH, GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+		glBindFramebuffer(GL_FRAMEBUFFER, currentFramebuffer);
+		if(scissor) glEnable(GL_SCISSOR_TEST);
+		capTaken = true;
+	}
+	*colorTex = capColor;
+	*depthTex = capDepth;
+	texSize[0] = (float)capW; texSize[1] = (float)capH;
+	viewport[0] = (float)glGlobals.presentOffX; viewport[1] = (float)glGlobals.presentOffY;
+	viewport[2] = (float)glGlobals.presentWidth; viewport[3] = (float)glGlobals.presentHeight;
+	memcpy(proj, uniformScene.proj, 64);
+	memcpy(view, uniformScene.view, 64);
+	return 1;
+}
+
 static void
 beginUpdate(Camera *cam)
 {
@@ -2039,6 +2104,7 @@ showRaster(Raster *raster, uint32 flags)
 	}
 	glfwSwapBuffers(glGlobals.window);
 	gScaledFrame = true;
+	capTaken = false;
 	if(gJitterApplied) memcpy(gPrevVP, gCurVP, sizeof(gPrevVP));
 	else gHistValid = false;
 	gJitterApplied = false;
@@ -2527,10 +2593,12 @@ startGLFW(void)
 					gRenderSharpness = (float)atof(line + 16);
 				else if(inGraphics && strncmp(line, "RenderTemporal=", 15) == 0)
 					gTemporal = atoi(line + 15) != 0;
+				else if(inGraphics && strncmp(line, "VehicleSSR=", 11) == 0)
+					gSSR = atoi(line + 11) != 0;
 			}
 			fclose(ini);
 		}
-		gUseTarget = gRenderScale < 1.0f || gTemporal;
+		gUseTarget = gRenderScale < 1.0f || gTemporal || gSSR;
 	}
 #ifdef __APPLE__
 	// The game sizes its framebuffer copies (post-processing, screen grabs) in window points.
