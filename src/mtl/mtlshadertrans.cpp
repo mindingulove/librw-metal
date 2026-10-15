@@ -192,6 +192,19 @@ toMsl(std::vector<unsigned> &spirv, bool isVertex, StageText &st, int stageIdx, 
 		prog.error = std::string("spirv-cross: ") + e.what();
 		return false;
 	}
+	if(isVertex){
+		// run-time y flip of the clip space position (render to texture keeps OpenGL's texture orientation)
+		size_t u = msl.find("using namespace metal;\n");
+		if(u != std::string::npos) msl.insert(u + 23, "\nconstant bool kFlipY [[function_constant(0)]];\n");
+		size_t r = msl.rfind("    return out;\n}");
+		if(r != std::string::npos) msl.insert(r, "    if(kFlipY) out.gl_Position.y = -out.gl_Position.y;\n");
+		// attribute locations the shader reads
+		size_t pos = 0;
+		while((pos = msl.find("[[attribute(", pos)) != std::string::npos){
+			pos += 12;
+			prog.vsAttribs.push_back(atoi(msl.c_str() + pos));
+		}
+	}
 	entry = c.get_entry_points_and_stages()[0].name;
 	// the entry point of a Metal library is renamed "main0" by SPIRV-Cross when it is called main
 	if(entry == "main") entry = "main0";

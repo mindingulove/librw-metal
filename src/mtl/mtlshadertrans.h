@@ -26,6 +26,7 @@ struct TransProgram {
 	int vsBlockSize, fsBlockSize;	// bytes of the uniform blocks (0: none)
 	std::vector<TransUniform> uniforms;
 	std::vector<TransSampler> samplers;
+	std::vector<int> vsAttribs;	// vertex attribute locations the vertex shader reads
 	std::string error;
 };
 
