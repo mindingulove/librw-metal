@@ -2206,21 +2206,18 @@ static const char *rsRTCompositeSrc =
 "#version 330\n"
 "uniform sampler2DRect rtTex;\n"
 "uniform sampler2D reflTex;\n"
+"uniform sampler2D velTex;\n"
 "uniform float strength;\n"
 "uniform int div;\n"
 "out vec4 fragColor;\n"
 "void main(){\n"
 "	ivec2 p = ivec2(gl_FragCoord.xy);\n"
 "	float w = texelFetch(reflTex, p, 0).a;\n"
+"	if(texelFetch(velTex, p, 0).a > 1.5) discard;	// characters never get a reflection laid over them\n"
 "	if(w <= 0.001) discard;\n"
 "	// soften the traced image a little (ripples, and the reflected colours are only per-material averages)\n"
-"	ivec2 hi = textureSize(rtTex) - 1;\n"
-"	ivec2 c = clamp(p/div, ivec2(0), hi);\n"
-"	int o = max(1, 2/div);\n"
-"	vec4 r = texelFetch(rtTex, c)*0.36;\n"
-"	r += texelFetch(rtTex, clamp(c + ivec2(o, 0), ivec2(0), hi))*0.16 + texelFetch(rtTex, clamp(c - ivec2(o, 0), ivec2(0), hi))*0.16;\n"
-"	r += texelFetch(rtTex, clamp(c + ivec2(0, o), ivec2(0), hi))*0.16 + texelFetch(rtTex, clamp(c - ivec2(0, o), ivec2(0), hi))*0.16;\n"
-"	fragColor = vec4(r.rgb, clamp(w*strength, 0.0, 1.0));\n"
+"	// the traced image is smaller than the screen: sample it with bilinear filtering (smooth, no blocks)\n"
+"	vec4 r = texture(rtTex, (vec2(p) + 0.5)/float(div));\n""	fragColor = vec4(r.rgb, clamp(w*strength, 0.0, 1.0));\n"
 "}\n";
 
 static const char *rsRTShadowSrc =
@@ -2286,6 +2283,14 @@ rsRayTracePass(void)
 		}
 		gRTGeom.clear();
 		if(!mrtSetup((rsW + gRTDiv - 1)/gRTDiv, (rsH + gRTDiv - 1)/gRTDiv, rsRTTex)){ rsRTLog("setup failed, ray tracing off"); rsRTFailed = true; return; }
+		{
+			GLint prevRect;
+			glGetIntegerv(GL_TEXTURE_BINDING_RECTANGLE, &prevRect);
+			glBindTexture(GL_TEXTURE_RECTANGLE, rsRTTex[2]);
+			glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+			glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+			glBindTexture(GL_TEXTURE_RECTANGLE, prevRect);
+		}
 		GLint prevFbo;
 		glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
 		if(!rsRTFbo) glGenFramebuffers(1, &rsRTFbo);
@@ -2342,6 +2347,11 @@ rsRayTracePass(void)
 			glUniform1i(glGetUniformLocation(rsRTCompProg, "rtTex"), 0);
 			glUniform1i(glGetUniformLocation(rsRTCompProg, "reflTex"), 1);
 			glUniform1i(glGetUniformLocation(rsRTCompProg, "div"), gRTDiv);
+			glActiveTexture(GL_TEXTURE2);
+			if(prevTex2 < 0) glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex2);
+			glBindTexture(GL_TEXTURE_2D, rsVelTex);
+			glActiveTexture(GL_TEXTURE0);
+			glUniform1i(glGetUniformLocation(rsRTCompProg, "velTex"), 2);
 			glUniform1f(glGetUniformLocation(rsRTCompProg, "strength"), gRTStrength);
 			glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 			glDrawArrays(GL_TRIANGLES, 0, 3);
@@ -2354,7 +2364,7 @@ rsRayTracePass(void)
 			glActiveTexture(GL_TEXTURE1);
 			glBindTexture(GL_TEXTURE_RECTANGLE, rsRTTex[0]);
 			glActiveTexture(GL_TEXTURE2);
-			glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex2);
+			if(prevTex2 < 0) glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex2);
 			glBindTexture(GL_TEXTURE_2D, natzb->texid);
 			glActiveTexture(GL_TEXTURE0);
 			glUniform1i(glGetUniformLocation(rsRTShadowProg, "depthFull"), 2);
@@ -2449,7 +2459,7 @@ resolveRenderScale(void)
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 		glActiveTexture(GL_TEXTURE2);
-		glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex2);
+		if(prevTex2 < 0) glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex2);
 		glBindTexture(GL_TEXTURE_2D, rsHistTex[rsHistCur]);
 		glActiveTexture(GL_TEXTURE3);
 		glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex3);

@@ -38,7 +38,11 @@ void WriteVel(void)
 {
 	vec2 a = v_posCur.xy/v_posCur.w;
 	vec2 b = v_posPrev.xy/v_posPrev.w;
+#ifdef PED_MARK
+	velOut = vec4((a - b)*0.5, 0.0, u_velOn*2.0);	// 2 = character
+#else
 	velOut = vec4((a - b)*0.5, 0.0, u_velOn);
+#endif
 }
 #define WRITE_VEL() WriteVel()
 #else
@@ -85,7 +89,7 @@ void DoWet(inout vec4 color)
 		float n = puddleNoise(v_rpos.xy*0.22)*0.65 + puddleNoise(v_rpos.xy*0.9)*0.35;
 		float puddle = smoothstep(0.56, 0.72, n)*smoothstep(0.25, 0.6, clamp(wetAmount*1.4, 0.0, 1.0))*u_roadPuddles;
 		wetWeight = wetAmount*mix(0.12, 0.9, v_rfres)*0.5 + puddle*0.95;
-		color.rgb *= 1.0 - 0.35*puddle;
+		color.rgb *= 1.0 - 0.15*puddle;
 	}
 }
 #define WET_FS(color) DoWet(color)
