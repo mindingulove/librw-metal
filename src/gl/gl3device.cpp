@@ -1866,6 +1866,7 @@ static const char *rsMfxPrepSrc =
 "layout(location = 0) out vec4 oColor;\n"
 "layout(location = 1) out vec4 oDepth;\n"
 "layout(location = 2) out vec4 oMotion;\n"
+"layout(location = 3) out vec4 oReactive;\n"
 "void main(){\n"
 "	ivec2 p = ivec2(gl_FragCoord.xy);\n"
 "	oColor = vec4(texelFetch(colorTex, p, 0).rgb, 1.0);\n"
@@ -1883,6 +1884,8 @@ static const char *rsMfxPrepSrc =
 "	}\n"
 "	// MetalFX: pixels from the current position to the previous one (rows run the other way in the shared memory)\n"
 "	oMotion = vec4(-v.x*lowSize.x, -v.y*lowSize.y, 0.0, 1.0);\n"
+"	// characters (velocity alpha 2): their skinning motion is not in the vectors, so the scaler must not trust history there\n"
+"	oReactive = vec4(vel.a > 1.5 ? 0.9 : 0.0, 0.0, 0.0, 1.0);\n"
 "}\n";
 
 static const char *rsMfxCopySrc =
@@ -1894,7 +1897,7 @@ static const char *rsMfxCopySrc =
 "}\n";
 
 static GLuint rsMfxPrepProg, rsMfxCopyProg, rsMfxFbo;
-static unsigned rsMfxTex[4];
+static unsigned rsMfxTex[5];
 static int rsMfxIn[2], rsMfxOut[2];
 static bool rsMfxReady, rsMfxFailed;
 
@@ -1929,10 +1932,10 @@ rsMfxEnsure(void)
 	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
 	if(!rsMfxFbo) glGenFramebuffers(1, &rsMfxFbo);
 	glBindFramebuffer(GL_FRAMEBUFFER, rsMfxFbo);
-	for(int i = 0; i < 3; i++)
-		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + i, GL_TEXTURE_RECTANGLE, rsMfxTex[i], 0);
-	static const GLenum bufs[3] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2 };
-	glDrawBuffers(3, bufs);
+	for(int i = 0; i < 4; i++)
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + i, GL_TEXTURE_RECTANGLE, rsMfxTex[i == 3 ? 4 : i], 0);
+	static const GLenum bufs[4] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2, GL_COLOR_ATTACHMENT3 };
+	glDrawBuffers(4, bufs);
 	GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
 	glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
 	if(st != GL_FRAMEBUFFER_COMPLETE){
@@ -2225,6 +2228,7 @@ static const char *rsRTShadowSrc =
 "uniform sampler2DRect shadowTex;\n"
 "uniform sampler2DRect depthRect;\n"
 "uniform sampler2D depthFull;\n"
+"uniform sampler2D reflTex;\n"
 "uniform float strength;\n"
 "uniform vec2 nearFar;\n"
 "uniform int div;\n"
@@ -2236,6 +2240,8 @@ static const char *rsRTShadowSrc =
 "void main(){\n"
 "	ivec2 p = ivec2(gl_FragCoord.xy);\n"
 "	ivec2 hi = textureSize(depthRect) - 1;\n"
+"	// wet ground with puddles (or a reflection) gets no traced shadow: the two effects mixed into flickering patches\n"
+"	float puddleW = texelFetch(reflTex, p, 0).a;\n"
 "	float dc = texelFetch(depthFull, p, 0).r;\n"
 "	if(dc >= 0.99999) discard;\n"
 "	float lc = lin(dc);\n"
@@ -2252,6 +2258,7 @@ static const char *rsRTShadowSrc =
 "		ws += w;\n"
 "	}\n"
 "	float s = sum/max(ws, 1e-4);\n"
+"	s *= 1.0 - clamp(puddleW*2.5, 0.0, 1.0);\n"
 "	if(s <= 0.004) discard;\n"
 "	fragColor = vec4(vec3(1.0 - s*strength), 1.0);\n"
 "}\n";
@@ -2306,7 +2313,7 @@ rsRayTracePass(void)
 		return;	// geometry is registered from now on; first traced frame is the next one
 	}
 	Gl3Raster *natzb = PLUGINOFFSET(Gl3Raster, rsCamera->zBuffer->parent, nativeRasterOffset);
-	GLint prevTex0, prevTex1, prevRect0, prevRect1, prevTex2 = -1;
+	GLint prevTex0, prevTex1, prevRect0, prevRect1, prevTex2 = -1, prevTex3 = -1;
 	glActiveTexture(GL_TEXTURE0); glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex0); glGetIntegerv(GL_TEXTURE_BINDING_RECTANGLE, &prevRect0);
 	glActiveTexture(GL_TEXTURE1); glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex1); glGetIntegerv(GL_TEXTURE_BINDING_RECTANGLE, &prevRect1);
 
@@ -2367,6 +2374,11 @@ rsRayTracePass(void)
 			if(prevTex2 < 0) glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex2);
 			glBindTexture(GL_TEXTURE_2D, natzb->texid);
 			glActiveTexture(GL_TEXTURE0);
+			glActiveTexture(GL_TEXTURE3);
+			glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex3);
+			glBindTexture(GL_TEXTURE_2D, rsReflTex);
+			glActiveTexture(GL_TEXTURE0);
+			glUniform1i(glGetUniformLocation(rsRTShadowProg, "reflTex"), 3);
 			glUniform1i(glGetUniformLocation(rsRTShadowProg, "depthFull"), 2);
 			glUniform1i(glGetUniformLocation(rsRTShadowProg, "div"), gRTDiv);
 			glUniform1i(glGetUniformLocation(rsRTShadowProg, "shadowTex"), 0);
@@ -2378,6 +2390,7 @@ rsRayTracePass(void)
 		}
 		glDisable(GL_BLEND);
 	}
+	if(prevTex3 >= 0){ glActiveTexture(GL_TEXTURE3); glBindTexture(GL_TEXTURE_2D, prevTex3); }
 	if(prevTex2 >= 0){ glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, prevTex2); }
 	glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, prevTex1); glBindTexture(GL_TEXTURE_RECTANGLE, prevRect1);
 	glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, prevTex0); glBindTexture(GL_TEXTURE_RECTANGLE, prevRect0);
