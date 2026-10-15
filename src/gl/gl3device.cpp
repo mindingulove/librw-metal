@@ -2182,6 +2182,9 @@ rtCollect(Atomic *atomic, InstanceDataHeader*)
 		mrtAddInstance(e.id, (const float*)&uniformObject.world, regtaVelocityDynamic ? 0 : (uintptr_t)atomic->getFrame()->getLTM());
 }
 
+// REGTA_DEBUG_RT=1: draw the ray traced reflection weights in red and the traced shadows in green instead of applying them
+static bool rtDebugView(void){ static int v = getenv("REGTA_DEBUG_RT") ? 1 : 0; return v != 0; }
+
 static const char *rsRTPrepSrc =
 "#version 330\n"
 "uniform sampler2D depthTex;\n"
@@ -2212,6 +2215,7 @@ static const char *rsRTCompositeSrc =
 "uniform sampler2D velTex;\n"
 "uniform float strength;\n"
 "uniform int div;\n"
+"uniform float dbg;\n"
 "out vec4 fragColor;\n"
 "void main(){\n"
 "	ivec2 p = ivec2(gl_FragCoord.xy);\n"
@@ -2220,7 +2224,7 @@ static const char *rsRTCompositeSrc =
 "	if(w <= 0.001) discard;\n"
 "	// soften the traced image a little (ripples, and the reflected colours are only per-material averages)\n"
 "	// the traced image is smaller than the screen: sample it with bilinear filtering (smooth, no blocks)\n"
-"	vec4 r = texture(rtTex, (vec2(p) + 0.5)/float(div));\n""	fragColor = vec4(r.rgb, clamp(w*strength, 0.0, 1.0));\n"
+"	vec4 r = texture(rtTex, (vec2(p) + 0.5)/float(div));\n""	fragColor = dbg > 0.5 ? vec4(1.0, 0.0, 0.0, clamp(w*2.0, 0.0, 1.0)) : vec4(r.rgb, clamp(w*strength, 0.0, 1.0));\n"
 "}\n";
 
 static const char *rsRTShadowSrc =
@@ -2232,6 +2236,7 @@ static const char *rsRTShadowSrc =
 "uniform float strength;\n"
 "uniform vec2 nearFar;\n"
 "uniform int div;\n"
+"uniform float dbg;\n"
 "out vec4 fragColor;\n"
 "float lin(float d){\n"
 "	float z = d*2.0 - 1.0;\n"
@@ -2260,7 +2265,7 @@ static const char *rsRTShadowSrc =
 "	float s = sum/max(ws, 1e-4);\n"
 "	s *= 1.0 - clamp(puddleW*2.5, 0.0, 1.0);\n"
 "	if(s <= 0.004) discard;\n"
-"	fragColor = vec4(vec3(1.0 - s*strength), 1.0);\n"
+"	fragColor = dbg > 0.5 ? vec4(0.0, 1.0, 0.0, clamp(s*2.0, 0.0, 1.0)) : vec4(vec3(1.0 - s*strength), 1.0);\n"
 "}\n";
 
 static GLuint rsRTShadowProg;
@@ -2360,6 +2365,7 @@ rsRayTracePass(void)
 			glActiveTexture(GL_TEXTURE0);
 			glUniform1i(glGetUniformLocation(rsRTCompProg, "velTex"), 2);
 			glUniform1f(glGetUniformLocation(rsRTCompProg, "strength"), gRTStrength);
+			glUniform1f(glGetUniformLocation(rsRTCompProg, "dbg"), rtDebugView() ? 1.0f : 0.0f);
 			glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 			glDrawArrays(GL_TRIANGLES, 0, 3);
 		}
@@ -2385,7 +2391,8 @@ rsRayTracePass(void)
 			glUniform1i(glGetUniformLocation(rsRTShadowProg, "depthRect"), 1);
 			glUniform2f(glGetUniformLocation(rsRTShadowProg, "nearFar"), rsCamera->nearPlane, rsCamera->farPlane);
 			glUniform1f(glGetUniformLocation(rsRTShadowProg, "strength"), gRTShadowStrength*gRTEnv.sunVisibility);
-			glBlendFunc(GL_ZERO, GL_SRC_COLOR);
+			glUniform1f(glGetUniformLocation(rsRTShadowProg, "dbg"), rtDebugView() ? 1.0f : 0.0f);
+			if(rtDebugView()) glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); else glBlendFunc(GL_ZERO, GL_SRC_COLOR);
 			glDrawArrays(GL_TRIANGLES, 0, 3);
 		}
 		glDisable(GL_BLEND);
