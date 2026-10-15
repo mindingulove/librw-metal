@@ -2012,7 +2012,7 @@ struct RtEnv {
 int mrtSetup(int width, int height, unsigned *glTex);
 void mrtShutdown(void);
 int mrtReady(void);
-int mrtAddGeometry(const float *positions, int numVerts, int numMeshes, const uint32_t *const *indices, const int *indexCount, const float *colours, int castsShadow);
+int mrtAddGeometry(const float *positions, int numVerts, int numMeshes, const uint32_t *const *indices, const int *indexCount, const float *colours, const int *meshCasts);
 void mrtFrameBegin(void);
 void mrtAddInstance(int geometry, const float *world, uintptr_t key);
 int mrtTrace(const float *invViewProj, const RtEnv *env);
@@ -2100,7 +2100,8 @@ rtCollect(Atomic *atomic, InstanceDataHeader*)
 		std::vector<const uint32_t*> ptrs(mh->numMeshes);
 		std::vector<int> counts(mh->numMeshes);
 		std::vector<float> colours(mh->numMeshes*3);
-		bool casts = true;	// alpha tested / blended surfaces (leaves, fences, glass) would cast solid shadows: skip those
+		std::vector<int> meshCasts(mh->numMeshes, 1);	// alpha tested / blended meshes (leaves, fences, glass) would cast solid shadows
+		bool groundLike = false;
 		Mesh *meshes = mh->getMeshes();
 		bool bad = false;
 		for(uint32 m = 0; m < mh->numMeshes && !bad; m++){
@@ -2124,14 +2125,14 @@ rtCollect(Atomic *atomic, InstanceDataHeader*)
 			float tc[3];
 			rtTextureColour(me->material ? me->material->texture : nil, tc);
 			RGBA mc = me->material ? me->material->color : RGBA{255,255,255,255};
-			if(mc.alpha < 255) casts = false;
+			if(mc.alpha < 255) meshCasts[m] = 0;
 			if(me->material && me->material->texture && me->material->texture->raster &&
-			   PLUGINOFFSET(Gl3Raster, me->material->texture->raster, nativeRasterOffset)->hasAlpha) casts = false;
+			   PLUGINOFFSET(Gl3Raster, me->material->texture->raster, nativeRasterOffset)->hasAlpha) meshCasts[m] = 0;
 			colours[m*3+0] = tc[0]*mc.red/255.0f;
 			colours[m*3+1] = tc[1]*mc.green/255.0f;
 			colours[m*3+2] = tc[2]*mc.blue/255.0f;
 		}
-		if(!bad && casts){
+		if(!bad && !regtaVelocityDynamic){
 			// ground-like meshes (roads, pavements, grass, terrain) must not cast shadows: they lie on or just under the surfaces
 			// that receive them, so rays hit them by accident and leave large dark patches. Skip flat meshes and meshes that are
 			// mostly horizontal, upward facing surface.
@@ -2149,12 +2150,13 @@ rtCollect(Atomic *atomic, InstanceDataHeader*)
 					if(len > 0.0f && fabsf(nz)/len > 0.7f) areaUp += len;
 				}
 			}
-			if(zmax - zmin < 0.35f || (areaAll > 0.0f && areaUp/areaAll > 0.6f)) casts = false;
+			if(zmax - zmin < 0.35f || (areaAll > 0.0f && areaUp/areaAll > 0.6f)) groundLike = true;
 		}
+		if(groundLike) for(auto &c : meshCasts) c = 0;
 		if(bad){
 			e.id = -1;
 		}else{
-			int id = mrtAddGeometry((const float*)g->morphTargets[0].vertices, g->numVertices, (int)mh->numMeshes, ptrs.data(), counts.data(), colours.data(), casts ? 1 : 0);
+			int id = mrtAddGeometry((const float*)g->morphTargets[0].vertices, g->numVertices, (int)mh->numMeshes, ptrs.data(), counts.data(), colours.data(), meshCasts.data());
 			e.id = id;
 			e.numVerts = g->numVertices;
 			e.numIdx = mh->totalIndices;
