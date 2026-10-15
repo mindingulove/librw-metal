@@ -2357,6 +2357,9 @@ rsRTLog(const char *msg)
 	if(FILE *f = fopen("metalfx.log", "a")){ fprintf(f, "%s\n", msg); fclose(f); }
 }
 
+// true while ray traced reflections work: the game can then refresh its (expensive) environment map rarely
+extern "C" int regtaRTReflectionsActive(void){ return (gRT && !rsRTFailed && mrtReady()) ? 1 : 0; }
+
 // Traces reflections for the pixels the vehicle shader marked and blends the result into the scene colour.
 static void
 rsRayTracePass(void)
