@@ -1890,6 +1890,7 @@ static const char *rsMfxPrepSrc =
 "uniform sampler2D colorTex;\n"
 "uniform sampler2D depthTex;\n"
 "uniform sampler2D velTex;\n"
+"uniform sampler2D dynShadow;\n"
 "uniform vec2 lowSize;\n"
 "uniform mat4 invVP;\n"
 "uniform mat4 prevVP;\n"
@@ -1915,7 +1916,11 @@ static const char *rsMfxPrepSrc =
 "	// MetalFX: pixels from the current position to the previous one (rows run the other way in the shared memory)\n"
 "	oMotion = vec4(-v.x*lowSize.x, -v.y*lowSize.y, 0.0, 1.0);\n"
 "	// characters (velocity alpha 2): their skinning motion is not in the vectors, so the scaler must not trust history there\n"
-"	oReactive = vec4(vel.a > 1.5 ? 0.9 : 0.0, 0.0, 0.0, 1.0);\n"
+"	// moving shadows (cars, props) smear in a temporal upscaler: their pixels and a margin around them follow the current frame\n"
+"	vec2 uv0 = gl_FragCoord.xy/lowSize;\n"
+"	vec2 o = vec2(6.0)/lowSize;\n"
+"	float dyn = max(max(texture(dynShadow, uv0).g, texture(dynShadow, uv0 + vec2(o.x, 0.0)).g), max(texture(dynShadow, uv0 - vec2(o.x, 0.0)).g, max(texture(dynShadow, uv0 + vec2(0.0, o.y)).g, texture(dynShadow, uv0 - vec2(0.0, o.y)).g)));\n"
+"	oReactive = vec4(max(vel.a > 1.5 ? 0.9 : 0.0, smoothstep(0.02, 0.25, dyn)*0.9), 0.0, 0.0, 1.0);\n"
 "}\n";
 
 static const char *rsMfxCopySrc =
@@ -2007,6 +2012,12 @@ rsMetalFXPass(void)
 	glUniform1i(glGetUniformLocation(rsMfxPrepProg, "colorTex"), 0);
 	glUniform1i(glGetUniformLocation(rsMfxPrepProg, "depthTex"), 1);
 	glUniform1i(glGetUniformLocation(rsMfxPrepProg, "velTex"), 3);
+	GLint prevDynTex = 0;
+	glActiveTexture(GL_TEXTURE2);
+	glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevDynTex);
+	glBindTexture(GL_TEXTURE_2D, gShadowStrengthNow > 0.001f ? gShadowOutTex : 0);
+	glActiveTexture(GL_TEXTURE0);
+	glUniform1i(glGetUniformLocation(rsMfxPrepProg, "dynShadow"), 2);
 	glUniform2f(glGetUniformLocation(rsMfxPrepProg, "lowSize"), (float)rsW, (float)rsH);
 	glUniformMatrix4fv(glGetUniformLocation(rsMfxPrepProg, "invVP"), 1, GL_FALSE, gInvVP);
 	glUniformMatrix4fv(glGetUniformLocation(rsMfxPrepProg, "prevVP"), 1, GL_FALSE, gPrevVP);
@@ -2032,6 +2043,7 @@ rsMetalFXPass(void)
 		rsMfxReady = false;
 	}
 	glActiveTexture(GL_TEXTURE3); glBindTexture(GL_TEXTURE_2D, prevTex3);
+	glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, prevDynTex);
 	glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, prevTex1);
 	glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, prevTex0); glBindTexture(GL_TEXTURE_RECTANGLE, prevRect0);
 	return ok;
