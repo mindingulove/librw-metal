@@ -292,6 +292,8 @@ static GLuint gSceneQuery[2];
 static int gSceneQi;
 static bool gSceneQueryActive, gSceneQueryHave[2];
 static double gSceneFrameStart;
+// timer queries are optional in the GL loader: only use them when every entry point exists
+static inline bool sceneQueriesUsable(void){ return glGenQueries && glBeginQuery && glEndQuery && glGetQueryObjectuiv && glGetQueryObjectui64v; }
 static double gCollectAcc;	// time spent registering geometry with the ray tracer this frame
 static inline double perfNow(void){ return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 extern "C" void regtaPerfGet(float *ms){ ms[0] = gPerfMs[0]; ms[1] = gPerfMs[1]; ms[2] = gPerfMs[2]; ms[3] = gPerfMs[3]; ms[4] = gPerfMs[4]; ms[5] = gPerfMs[5]; }
@@ -2542,7 +2544,17 @@ resolveRenderScale(void)
 	double resolveT0 = perfNow();
 	// how long the scene took: CPU time since the frame began, and GPU time from a timer query (read one frame late)
 	gPerfMs[4] += ((float)(resolveT0 - gSceneFrameStart) - gPerfMs[4])*0.05f;
-	if(gSceneQueryActive){
+	if(!sceneQueriesUsable()){
+		// no timer queries in this GL loader: with REGTA_PERF_FINISH=1 wait for the GPU here and report how long that took, which
+		// is how much scene work the GPU still had queued when the CPU finished submitting it
+		static int perfFinish = getenv("REGTA_PERF_FINISH") ? 1 : 0;
+		if(perfFinish){
+			double t = perfNow();
+			glFinish();
+			gPerfMs[5] += ((float)(perfNow() - t) - gPerfMs[5])*0.05f;
+		}
+	}
+	if(gSceneQueryActive && sceneQueriesUsable()){
 		glEndQuery(GL_TIME_ELAPSED);
 		gSceneQueryActive = false;
 		gSceneQueryHave[gSceneQi] = true;
@@ -3038,10 +3050,12 @@ showRaster(Raster *raster, uint32 flags)
 	glfwSwapBuffers(glGlobals.window);
 	gScaledFrame = true;
 	gSceneFrameStart = perfNow();
-	if(!gSceneQuery[0]) glGenQueries(2, gSceneQuery);
-	if(gSceneQueryActive){ glEndQuery(GL_TIME_ELAPSED); gSceneQueryActive = false; }
-	glBeginQuery(GL_TIME_ELAPSED, gSceneQuery[gSceneQi]);
-	gSceneQueryActive = true;
+	if(sceneQueriesUsable()){
+		if(!gSceneQuery[0]) glGenQueries(2, gSceneQuery);
+		if(gSceneQueryActive){ glEndQuery(GL_TIME_ELAPSED); gSceneQueryActive = false; }
+		glBeginQuery(GL_TIME_ELAPSED, gSceneQuery[gSceneQi]);
+		gSceneQueryActive = true;
+	}
 	gPerfMs[3] += ((float)gCollectAcc - gPerfMs[3])*0.05f;
 	gCollectAcc = 0.0;
 	capTaken = false;
