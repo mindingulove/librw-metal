@@ -57,10 +57,10 @@ FSIN float v_rfres;
 FSIN vec3 v_rpos;
 FSIN vec3 v_rrel;
 uniform float u_roadPuddles;	// 1: rain puddles on, 0: only the faint wet film
-uniform sampler2DRect u_rtPrev;	// last frame's ray traced reflections (screen space)
+uniform sampler2D u_rtPrev;	// last frame's ray traced reflections (screen space, already softened)
 uniform vec2 u_rtSize;
 uniform vec2 u_rtParams;	// x: reflections available, y: strength
-uniform sampler2DRect u_shadowPrev;	// last frame's traced sun shadows (same size as the reflection image)
+uniform sampler2D u_shadowPrev;	// last frame's traced sun shadows (softened, same size)
 uniform vec2 u_shadowParams;	// x: shadows available, y: strength
 layout(location = 2) out vec4 reflOut;
 float wetWeight = 0.0;
@@ -102,10 +102,7 @@ void DoWet(inout vec4 color)
 	if(groundMark > 0.5 && u_shadowParams.x > 0.5 && v_posPrev.w > 0.0){
 		vec2 spu = (v_posPrev.xy/v_posPrev.w)*0.5 + 0.5;
 		if(spu.x > 0.0 && spu.x < 1.0 && spu.y > 0.0 && spu.y < 1.0){
-			vec2 stc = spu*u_rtSize;
-			float sh = texture(u_shadowPrev, stc).r*0.4
-			         + texture(u_shadowPrev, stc + vec2(1.5, 0.0)).r*0.15 + texture(u_shadowPrev, stc - vec2(1.5, 0.0)).r*0.15
-			         + texture(u_shadowPrev, stc + vec2(0.0, 1.5)).r*0.15 + texture(u_shadowPrev, stc - vec2(0.0, 1.5)).r*0.15;
+			float sh = texture(u_shadowPrev, spu).r;
 			color.rgb *= 1.0 - clamp(sh*u_shadowParams.y, 0.0, 1.0);
 		}
 	}
@@ -119,11 +116,7 @@ void DoWet(inout vec4 color)
 		if(u_rtParams.x > 0.5 && v_posPrev.w > 0.0){
 			vec2 pu = (v_posPrev.xy/v_posPrev.w)*0.5 + 0.5;
 			if(pu.x > 0.0 && pu.x < 1.0 && pu.y > 0.0 && pu.y < 1.0){
-				vec2 tc = pu*u_rtSize;
-				// five bilinear taps: the facade pattern seen in the reflection changes with every angle, soften it
-				vec4 r = texture(u_rtPrev, tc)*0.4
-				       + texture(u_rtPrev, tc + vec2(1.5, 0.0))*0.15 + texture(u_rtPrev, tc - vec2(1.5, 0.0))*0.15
-				       + texture(u_rtPrev, tc + vec2(0.0, 1.5))*0.15 + texture(u_rtPrev, tc - vec2(0.0, 1.5))*0.15;
+				vec4 r = texture(u_rtPrev, pu);
 				// the filtered image holds colour*coverage in rgb and coverage in a: undo that so edges fade instead of flicker
 				color.rgb = mix(color.rgb, r.rgb/max(r.a, 0.001), clamp(wetWeight*u_rtParams.y, 0.0, 1.0)*smoothstep(0.0, 0.6, r.a));
 			}

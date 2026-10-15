@@ -1157,10 +1157,10 @@ uploadVelocityUniforms(Shader *s)
 	if(s->velFrame != gFrameIdx || s->velScene != gSceneSerial){
 		if(s->velLoc[0] >= 0) glUniformMatrix4fv(s->velLoc[0], 1, GL_FALSE, gCurVP);
 		if(s->velLoc[1] >= 0) glUniformMatrix4fv(s->velLoc[1], 1, GL_FALSE, gPrevVP);
-		if(s->rtLoc[0] >= 0) glUniform1i(s->rtLoc[0], 6);
+		if(s->rtLoc[0] >= 0) glUniform1i(s->rtLoc[0], 4);
 		if(s->rtLoc[1] >= 0) glUniform2f(s->rtLoc[1], (float)gRTOutW, (float)gRTOutH);
 		if(s->rtLoc[2] >= 0) glUniform2f(s->rtLoc[2], (gRTOutTex && rtWantsRefl() && gRoadWet > 0.05f) ? 1.0f : 0.0f, gRTStrength);
-		if(s->rtLoc[3] >= 0) glUniform1i(s->rtLoc[3], 7);
+		if(s->rtLoc[3] >= 0) glUniform1i(s->rtLoc[3], 5);
 		if(s->rtLoc[4] >= 0) glUniform2f(s->rtLoc[4], (gShadowOutTex && gShadowStrengthNow > 0.001f) ? 1.0f : 0.0f, gShadowStrengthNow);
 		s->velFrame = gFrameIdx;
 		s->velScene = gSceneSerial;
@@ -2295,6 +2295,42 @@ static const char *rsRTShadowSrc =
 "	fragColor = dbg > 0.5 ? vec4(0.0, 1.0, 0.0, clamp(s*2.0, 0.0, 1.0)) : vec4(vec3(1.0 - s*strength), 1.0);\n"
 "}\n";
 
+// softens the traced images once per frame (depth aware for the shadows) so ground shaders need one filtered tap each
+static const char *rsRTBlurSrc =
+"#version 330\n"
+"uniform sampler2DRect shadowTex;\n"
+"uniform sampler2DRect reflRect;\n"
+"uniform sampler2DRect depthRect;\n"
+"uniform vec2 nearFar;\n"
+"layout(location = 0) out vec4 oShadow;\n"
+"layout(location = 1) out vec4 oRefl;\n"
+"float lin(float d){\n"
+"	float z = d*2.0 - 1.0;\n"
+"	return 2.0*nearFar.x*nearFar.y/(nearFar.y + nearFar.x - z*(nearFar.y - nearFar.x));\n"
+"}\n"
+"void main(){\n"
+"	ivec2 p = ivec2(gl_FragCoord.xy);\n"
+"	ivec2 hi = textureSize(depthRect) - 1;\n"
+"	float lc = lin(texelFetch(depthRect, p).r);\n"
+"	float sum = 0.0, ws = 0.0;\n"
+"	for(int y = -2; y <= 2; y++)\n"
+"	for(int x = -2; x <= 2; x++){\n"
+"		ivec2 q = clamp(p + ivec2(x, y), ivec2(0), hi);\n"
+"		float lq = lin(texelFetch(depthRect, q).r);\n"
+"		float w = exp(-float(x*x + y*y)*0.45)*exp(-abs(lq - lc)/(0.03*lc + 0.05));\n"
+"		sum += texelFetch(shadowTex, q).r*w;\n"
+"		ws += w;\n"
+"	}\n"
+"	oShadow = vec4(sum/max(ws, 1e-4), 0.0, 0.0, 1.0);\n"
+"	vec4 r = texelFetch(reflRect, p)*0.25;\n"
+"	r += (texelFetch(reflRect, clamp(p + ivec2(1, 0), ivec2(0), hi)) + texelFetch(reflRect, clamp(p - ivec2(1, 0), ivec2(0), hi))\n"
+"	    + texelFetch(reflRect, clamp(p + ivec2(0, 1), ivec2(0), hi)) + texelFetch(reflRect, clamp(p - ivec2(0, 1), ivec2(0), hi)))*0.125;\n"
+"	r += (texelFetch(reflRect, clamp(p + ivec2(1, 1), ivec2(0), hi)) + texelFetch(reflRect, clamp(p - ivec2(1, 1), ivec2(0), hi))\n"
+"	    + texelFetch(reflRect, clamp(p + ivec2(1, -1), ivec2(0), hi)) + texelFetch(reflRect, clamp(p - ivec2(1, -1), ivec2(0), hi)))*0.0625;\n"
+"	oRefl = r;\n"
+"}\n";
+static GLuint rsBlurProg, rsBlurFbo, rsBlurTex[2];
+
 static GLuint rsRTShadowProg;
 static GLuint rsRTPrepProg, rsRTCompProg, rsRTFbo;
 static unsigned rsRTTex[4];
@@ -2318,7 +2354,8 @@ rsRayTracePass(void)
 			rsRTPrepProg = rsCompile(rsVertSrc, rsRTPrepSrc);
 			rsRTCompProg = rsCompile(rsVertSrc, rsRTCompositeSrc);
 			rsRTShadowProg = rsCompile(rsVertSrc, rsRTShadowSrc);
-			if(!rsRTPrepProg || !rsRTCompProg || !rsRTShadowProg){ rsRTLog("shader compile failed, ray tracing off"); rsRTFailed = true; return; }
+			rsBlurProg = rsCompile(rsVertSrc, rsRTBlurSrc);
+			if(!rsRTPrepProg || !rsRTCompProg || !rsRTShadowProg || !rsBlurProg){ rsRTLog("shader compile failed, ray tracing off"); rsRTFailed = true; return; }
 		}
 		gRTGeom.clear();
 		gRTOutTex = 0;
@@ -2344,9 +2381,30 @@ rsRayTracePass(void)
 		glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
 		if(st != GL_FRAMEBUFFER_COMPLETE){ rsRTLog("input framebuffer incomplete, ray tracing off"); mrtShutdown(); rsRTFailed = true; return; }
 		rsRTSize[0] = rsW; rsRTSize[1] = rsH;
-		gRTOutTex = rsRTTex[2];
-		gShadowOutTex = rsRTTex[3];
 		gRTOutW = (rsW + gRTDiv - 1)/gRTDiv; gRTOutH = (rsH + gRTDiv - 1)/gRTDiv;
+		{
+			// softened copies of the traced images (ordinary textures) that the ground shaders read next frame
+			GLint prevT;
+			glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevT);
+			if(!rsBlurFbo) glGenFramebuffers(1, &rsBlurFbo);
+			glBindFramebuffer(GL_FRAMEBUFFER, rsBlurFbo);
+			for(int i = 0; i < 2; i++){
+				if(!rsBlurTex[i]) glGenTextures(1, &rsBlurTex[i]);
+				glBindTexture(GL_TEXTURE_2D, rsBlurTex[i]);
+				glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, gRTOutW, gRTOutH, 0, GL_RGBA, GL_HALF_FLOAT, nil);
+				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+				glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + i, GL_TEXTURE_2D, rsBlurTex[i], 0);
+			}
+			static const GLenum bb[2] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1 };
+			glDrawBuffers(2, bb);
+			glBindTexture(GL_TEXTURE_2D, prevT);
+			glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
+		}
+		gShadowOutTex = rsBlurTex[0];
+		gRTOutTex = rsBlurTex[1];
 		return;	// geometry is registered from now on; first traced frame is the next one
 	}
 	Gl3Raster *natzb = PLUGINOFFSET(Gl3Raster, rsCamera->zBuffer->parent, nativeRasterOffset);
@@ -2376,6 +2434,27 @@ rsRayTracePass(void)
 	gShadowStrengthNow = (gRTShadows && gRTEnv.sunVisibility > 0.01f) ? gRTShadowStrength*gRTEnv.sunVisibility : 0.0f;
 	bool ok = mrtTrace(gInvVPJit, &gRTEnv) != 0;
 	if(ok){
+		{
+			// soften the traced images once, for the ground shaders (they read them next frame with a single tap)
+			GLint prevR0, prevR1, prevR2;
+			glActiveTexture(GL_TEXTURE0); glGetIntegerv(GL_TEXTURE_BINDING_RECTANGLE, &prevR0);
+			glActiveTexture(GL_TEXTURE1); glGetIntegerv(GL_TEXTURE_BINDING_RECTANGLE, &prevR1);
+			glActiveTexture(GL_TEXTURE2); glGetIntegerv(GL_TEXTURE_BINDING_RECTANGLE, &prevR2);
+			glBindFramebuffer(GL_FRAMEBUFFER, rsBlurFbo);
+			glViewport(0, 0, gRTOutW, gRTOutH);
+			glUseProgram(rsBlurProg);
+			glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_RECTANGLE, rsRTTex[3]);
+			glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_RECTANGLE, rsRTTex[2]);
+			glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_RECTANGLE, rsRTTex[0]);
+			glUniform1i(glGetUniformLocation(rsBlurProg, "shadowTex"), 0);
+			glUniform1i(glGetUniformLocation(rsBlurProg, "reflRect"), 1);
+			glUniform1i(glGetUniformLocation(rsBlurProg, "depthRect"), 2);
+			glUniform2f(glGetUniformLocation(rsBlurProg, "nearFar"), rsCamera->nearPlane, rsCamera->farPlane);
+			glDrawArrays(GL_TRIANGLES, 0, 3);
+			glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_RECTANGLE, prevR2);
+			glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_RECTANGLE, prevR1);
+			glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_RECTANGLE, prevR0);
+		}
 		// blend the traced colour over the paint where the vehicle shader marked a reflection
 		glBindFramebuffer(GL_FRAMEBUFFER, rsFbo);
 		static const GLenum b0[1] = { GL_COLOR_ATTACHMENT0 };
@@ -2678,13 +2757,13 @@ beginUpdate(Camera *cam)
 	float view[16], proj[16];
 	syncGfxSettings();
 	if(gRTOutTex){
-		// last frame's traced reflections for the ground shaders (unit 6 is not used by anything else)
+		// last frame's traced reflections for the ground shaders (units 4 and 5: nothing else draws with them)
 		GLint prevActive;
 		glGetIntegerv(GL_ACTIVE_TEXTURE, &prevActive);
-		glActiveTexture(GL_TEXTURE6);
-		glBindTexture(GL_TEXTURE_RECTANGLE, gRTOutTex);
-		glActiveTexture(GL_TEXTURE7);
-		glBindTexture(GL_TEXTURE_RECTANGLE, gShadowOutTex);
+		glActiveTexture(GL_TEXTURE4);
+		glBindTexture(GL_TEXTURE_2D, gRTOutTex);
+		glActiveTexture(GL_TEXTURE5);
+		glBindTexture(GL_TEXTURE_2D, gShadowOutTex);
 		glActiveTexture(prevActive);
 	}
 	// View Matrix
