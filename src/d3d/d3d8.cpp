@@ -527,6 +527,125 @@ readAsImage(Stream *stream, int32 width, int32 height, int32 depth, int32 format
 	return ras;
 }
 
+#ifndef RW_D3D9
+// DXT1-5 -> RGBA8, for builds that can't hand D3D textures to a real D3D device
+static void
+rgb565ToRGB(uint16 c, uint8 *o)
+{
+	o[0] = (uint8)(((c >> 11) & 31) * 255 / 31);
+	o[1] = (uint8)(((c >> 5) & 63) * 255 / 63);
+	o[2] = (uint8)((c & 31) * 255 / 31);
+}
+
+static void
+decodeDXT(const uint8 *src, int32 dxt, int32 w, int32 h, uint8 *dst, int32 stride)
+{
+	int32 bw = (w+3)/4, bh = (h+3)/4;
+	int32 blockSize = dxt == 1 ? 8 : 16;
+	for(int32 by = 0; by < bh; by++)
+		for(int32 bx = 0; bx < bw; bx++){
+			const uint8 *blk = src + (by*bw + bx)*blockSize;
+			const uint8 *cb = blk + (dxt == 1 ? 0 : 8);
+			uint16 c0 = cb[0] | cb[1]<<8, c1 = cb[2] | cb[3]<<8;
+			uint8 col[4][4];
+			rgb565ToRGB(c0, col[0]); rgb565ToRGB(c1, col[1]);
+			col[0][3] = col[1][3] = col[2][3] = col[3][3] = 255;
+			if(dxt != 1 || c0 > c1){
+				for(int k = 0; k < 3; k++){
+					col[2][k] = (2*col[0][k] + col[1][k])/3;
+					col[3][k] = (col[0][k] + 2*col[1][k])/3;
+				}
+			}else{
+				for(int k = 0; k < 3; k++){
+					col[2][k] = (col[0][k] + col[1][k])/2;
+					col[3][k] = 0;
+				}
+				col[3][3] = 0;
+			}
+			uint8 alpha[8];
+			if(dxt == 4 || dxt == 5){
+				alpha[0] = blk[0]; alpha[1] = blk[1];
+				if(alpha[0] > alpha[1])
+					for(int k = 1; k < 7; k++) alpha[k+1] = ((7-k)*alpha[0] + k*alpha[1])/7;
+				else{
+					for(int k = 1; k < 5; k++) alpha[k+1] = ((5-k)*alpha[0] + k*alpha[1])/5;
+					alpha[6] = 0; alpha[7] = 255;
+				}
+			}
+			for(int32 py = 0; py < 4; py++){
+				uint32 bits = cb[4+py];
+				for(int32 px = 0; px < 4; px++){
+					int32 x = bx*4 + px, y = by*4 + py;
+					if(x >= w || y >= h) continue;
+					const uint8 *c = col[(bits >> (px*2)) & 3];
+					uint8 *o = dst + y*stride + x*4;
+					o[0] = c[0]; o[1] = c[1]; o[2] = c[2]; o[3] = c[3];
+					if(dxt == 2 || dxt == 3){
+						uint16 row = blk[py*2] | blk[py*2+1]<<8;
+						o[3] = ((row >> (px*4)) & 15) * 17;
+					}else if(dxt == 4 || dxt == 5){
+						uint64 ab = 0;
+						for(int k = 0; k < 6; k++) ab |= (uint64)blk[2+k] << (8*k);
+						o[3] = alpha[(ab >> (3*(py*4+px))) & 7];
+					}
+				}
+			}
+		}
+}
+
+static Raster*
+readDXTAsImage(Stream *stream, int32 width, int32 height, int32 depth, int32 format, int32 numLevels, int32 dxt)
+{
+	(void)depth;
+	uint8 *data = nil;
+	int32 dataSize = 0;
+	int32 w0 = width, h0 = height;
+	Image *img = Image::create(width, height, 32);
+	img->allocate();
+	Raster *ras = nil;
+
+	for(int32 i = 0; i < numLevels; i++){
+		uint32 size = stream->readU32();
+		if(ras && i >= ras->getNumLevels()){
+			stream->seek(size);
+			continue;
+		}
+		if(data == nil || (int32)size > dataSize){
+			if(data) rwFree(data);
+			data = rwNewT(uint8, size, MEMDUR_FUNCTION | ID_IMAGE);
+			dataSize = size;
+		}
+		stream->read8(data, size);
+
+		int32 lw = w0 >> i, lh = h0 >> i;
+		if(lw < 1) lw = 1;
+		if(lh < 1) lh = 1;
+		if(ras){
+			ras->lock(i, Raster::LOCKWRITE|Raster::LOCKNOFETCH);
+			img->width = ras->width;
+			img->height = ras->height;
+			img->stride = img->width*img->bpp;
+			lw = img->width;
+			lh = img->height;
+		}
+		decodeDXT(data, dxt == 2 ? 3 : dxt == 4 ? 5 : dxt, lw, lh, img->pixels, img->stride);
+
+		if(ras == nil){
+			int32 newformat;
+			Raster::imageFindRasterFormat(img, format&7, &width, &height, &depth, &newformat);
+			newformat |= format & (Raster::MIPMAP | Raster::AUTOMIPMAP);
+			ras = Raster::create(width, height, depth, newformat);
+			ras->lock(i, Raster::LOCKWRITE|Raster::LOCKNOFETCH);
+		}
+		ras->setFromImage(img);
+		ras->unlock(i);
+	}
+	if(data) rwFree(data);
+	img->destroy();
+	return ras;
+}
+#endif
+
 Texture*
 readNativeTexture(Stream *stream)
 {
@@ -567,6 +686,13 @@ readNativeTexture(Stream *stream)
 			return tex;
 		}
 	}
+
+#ifndef RW_D3D9
+	if(compression){
+		tex->raster = readDXTAsImage(stream, width, height, depth, format|type, numLevels, compression);
+		return tex;
+	}
+#endif
 
 	Raster *raster;
 	D3dRaster *ras;

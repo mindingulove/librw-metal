@@ -276,6 +276,7 @@ struct Gl3Raster
 	uint8 addressV;
 	int32 maxAnisotropy;
 
+	float scale;		// camera textures / z buffers: texture pixels per raster unit (2 on a Retina screen)
 	uint32 fbo;		// used for camera texture only!
 	Raster *fboMate;	// color or zbuffer raster mate of this one
 	RasterLevels *backingStore;	// if we can't read back GPU memory but have to

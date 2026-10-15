@@ -1238,6 +1238,33 @@ setFrameBuffer(Camera *cam)
 	}
 }
 
+float
+getHidpiScale(void)
+{
+#ifdef LIBRW_GLFW
+	if(glGlobals.window){
+		int fw = 0, fh = 0, ww = 0, wh = 0;
+		glfwGetFramebufferSize(glGlobals.window, &fw, &fh);
+		glfwGetWindowSize(glGlobals.window, &ww, &wh);
+		if(ww > 0 && fw > ww) return (float)fw / (float)ww;
+	}
+#endif
+	return 1.0f;
+}
+
+float
+hidpiScaleFor(int32 w, int32 h)
+{
+	float s = getHidpiScale();
+	if(s <= 1.0f) return 1.0f;
+#ifdef LIBRW_GLFW
+	int ww = 0, wh = 0;
+	glfwGetWindowSize(glGlobals.window, &ww, &wh);
+	if(w >= ww / 2 && h >= wh / 2) return s;
+#endif
+	return 1.0f;
+}
+
 static Rect
 getFramebufferRect(Raster *frameBuffer)
 {
@@ -1254,19 +1281,39 @@ getFramebufferRect(Raster *frameBuffer)
 		missing implementation
 #endif
 	}else{
-		r.w = fb->width;
-		r.h = fb->height;
+		float tsc = PLUGINOFFSET(Gl3Raster, fb, nativeRasterOffset)->scale;
+		if(tsc < 1.0f) tsc = 1.0f;
+		r.w = (int32)(fb->width * tsc + 0.5f);
+		r.h = (int32)(fb->height * tsc + 0.5f);
 	}
 	r.x = 0;
 	r.y = 0;
 
 	// Got a subraster
 	if(frameBuffer != fb){
-		r.x = frameBuffer->offsetX;
+		// raster sizes are in window points, the default framebuffer is in pixels
+		// (they differ on HiDPI screens), so scale the viewport up
+		float sx = 1.0f, sy = 1.0f;
+		if(fb->type != Raster::CAMERA){
+			float tsc = PLUGINOFFSET(Gl3Raster, fb, nativeRasterOffset)->scale;
+			if(tsc > 1.0f) sx = sy = tsc;
+		}
+#ifdef LIBRW_GLFW
+		if(fb->type == Raster::CAMERA){
+			int ww, wh;
+			glfwGetWindowSize(glGlobals.window, &ww, &wh);
+			if(ww > 0 && wh > 0){
+				sx = (float)r.w / ww;
+				sy = (float)r.h / wh;
+			}
+		}
+#endif
+		r.x = (int32)(frameBuffer->offsetX * sx + 0.5f);
+		int32 h = (int32)(frameBuffer->height * sy + 0.5f);
 		// GL y offset is from bottom
-		r.y = r.h - frameBuffer->height - frameBuffer->offsetY;
-		r.w = frameBuffer->width;
-		r.h = frameBuffer->height;
+		r.y = r.h - h - (int32)(frameBuffer->offsetY * sy + 0.5f);
+		r.w = (int32)(frameBuffer->width * sx + 0.5f);
+		r.h = h;
 	}
 
 	return r;
@@ -1404,6 +1451,8 @@ clearCamera(Camera *cam, RGBA *col, uint32 mode)
 		glDisable(GL_SCISSOR_TEST);
 }
 
+extern "C" int regtaDumpRequest;
+
 static void
 showRaster(Raster *raster, uint32 flags)
 {
@@ -1423,10 +1472,69 @@ showRaster(Raster *raster, uint32 flags)
 		SDL_GL_SetSwapInterval(0);
 	SDL_GL_SwapWindow(glGlobals.window);
 #elif defined(LIBRW_GLFW)
-	if(flags & Raster::FLIPWAITVSYNCH)
-		glfwSwapInterval(1);
-	else
-		glfwSwapInterval(0);
+	// debugging aid: other code can ask for a frame to be saved (regtaDumpRequest = frames to wait; 0 = none)
+	{
+		static int signalCount = 0;
+		if(regtaDumpRequest > 0 && --regtaDumpRequest == 0){
+			int fw, fh;
+			glfwGetFramebufferSize(glGlobals.window, &fw, &fh);
+			uint8 *px = (uint8*)malloc(fw*fh*3);
+			glPixelStorei(GL_PACK_ALIGNMENT, 1);
+			glReadBuffer(GL_BACK);
+			glReadPixels(0, 0, fw, fh, GL_RGB, GL_UNSIGNED_BYTE, px);
+			char name[64];
+			snprintf(name, sizeof(name), "regta_signal_%d.ppm", ++signalCount);
+			if(FILE *f = fopen(name, "wb")){
+				fprintf(f, "P6\n%d %d\n255\n", fw, fh);
+				for(int y = fh-1; y >= 0; y--) fwrite(px + y*fw*3, 1, fw*3, f);
+				fclose(f);
+				printf("[dump] wrote %s (%dx%d)\n", name, fw, fh);
+			}
+			free(px);
+		}
+	}
+	// debugging aid: REGTA_DUMP_FRAMES="n1,n2,.." writes those frames' back buffer to PPM files
+	{
+		static int frame = 0;
+		static const char *spec = getenv("REGTA_DUMP_FRAMES");
+		frame++;
+		if(spec){
+			char want[32];
+			snprintf(want, sizeof(want), ",%d,", frame);
+			char all[512];
+			snprintf(all, sizeof(all), ",%s,", spec);
+			if(strstr(all, want)){
+				int fw, fh;
+				glfwGetFramebufferSize(glGlobals.window, &fw, &fh);
+				uint8 *px = (uint8*)malloc(fw*fh*3);
+				glPixelStorei(GL_PACK_ALIGNMENT, 1);
+				glReadBuffer(GL_BACK);
+				glReadPixels(0, 0, fw, fh, GL_RGB, GL_UNSIGNED_BYTE, px);
+				char name[64];
+				snprintf(name, sizeof(name), "regta_frame_%d.ppm", frame);
+				if(FILE *f = fopen(name, "wb")){
+					fprintf(f, "P6\n%d %d\n255\n", fw, fh);
+					for(int y = fh-1; y >= 0; y--)
+						fwrite(px + y*fw*3, 1, fw*3, f);
+					fclose(f);
+					printf("[dump] wrote %s (%dx%d)\n", name, fw, fh);
+				}
+				free(px);
+			}
+		}
+	}
+	// only touch the swap interval when it changes: re-applying it every frame
+	// reconfigures the display sync on macOS and shows up as flicker
+	// macOS can silently reset it (window move/resize/focus), so also re-assert it every
+	// 30 frames instead of trusting the cached value forever
+	static int curInterval = -1;
+	static int sinceSet = 0;
+	int wantInterval = (flags & Raster::FLIPWAITVSYNCH) ? 1 : 0;
+	if(wantInterval != curInterval || ++sinceSet >= 30){
+		glfwSwapInterval(wantInterval);
+		curInterval = wantInterval;
+		sinceSet = 0;
+	}
 	glfwSwapBuffers(glGlobals.window);
 #else
 	not implemented
@@ -1449,8 +1557,11 @@ rasterRenderFast(Raster *raster, int32 x, int32 y)
 		case Raster::CAMERA:
 			setActiveTexture(0);
 			glBindTexture(GL_TEXTURE_2D, natdst->texid);
-			glCopyTexSubImage2D(GL_TEXTURE_2D, 0, x, (dst->height-src->height)-y,
-				0, 0, src->width, src->height);
+			{
+				float sc = natdst->scale < 1.0f ? 1.0f : natdst->scale;
+				glCopyTexSubImage2D(GL_TEXTURE_2D, 0, (int32)(x*sc+.5f), (int32)(((dst->height-src->height)-y)*sc+.5f),
+					0, 0, (int32)(src->width*sc+.5f), (int32)(src->height*sc+.5f));
+			}
 			glBindTexture(GL_TEXTURE_2D, boundTexture[0]);
 			return 1;
 		}
@@ -1885,6 +1996,8 @@ static struct {
 	{ 0, 0, 0 },
 };
 
+extern "C" { int regtaDumpRequest = 0; }
+
 static int
 startGLFW(void)
 {
@@ -1894,6 +2007,25 @@ startGLFW(void)
 	mode = &glGlobals.modes[glGlobals.currentMode];
 
 	glfwSetErrorCallback(glfwerr);
+#ifdef __APPLE__
+	// The game sizes its framebuffer copies (post-processing, screen grabs) in window points.
+	// A 2x Retina framebuffer makes those copy only the lower-left quarter and stretch it
+	// (zoomed 3D view, ghosted menu), so keep one framebuffer pixel per window point.
+	{
+		// re3.ini [Graphics] Retina=1 draws at the screen's native pixels (screen-sized camera textures follow)
+		bool retina = false;
+		if(FILE *ini = fopen("re3.ini", "r")){
+			char line[256];
+			bool inGraphics = false;
+			while(fgets(line, sizeof(line), ini)){
+				if(line[0] == '[') inGraphics = strncmp(line, "[Graphics]", 10) == 0;
+				else if(inGraphics && strncmp(line, "Retina=", 7) == 0) retina = atoi(line + 7) != 0;
+			}
+			fclose(ini);
+		}
+		glfwWindowHint(GLFW_COCOA_RETINA_FRAMEBUFFER, retina ? GLFW_TRUE : GLFW_FALSE);
+	}
+#endif
 	glfwWindowHint(GLFW_RED_BITS, mode->mode.redBits);
 	glfwWindowHint(GLFW_GREEN_BITS, mode->mode.greenBits);
 	glfwWindowHint(GLFW_BLUE_BITS, mode->mode.blueBits);
@@ -1909,6 +2041,14 @@ startGLFW(void)
 		glfwWindowHint(GLFW_CLIENT_API, profiles[i].gl);
 		glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, profiles[i].major);
 		glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, profiles[i].minor);
+#ifdef __APPLE__
+		// macOS only provides 3.2+ contexts as forward-compatible core profiles;
+		// without this it falls back to a legacy 2.1 context.
+		if(profiles[i].gl == GLFW_OPENGL_API && profiles[i].major >= 3){
+			glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
+			glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+		}
+#endif
 
 		if(mode->flags & VIDEOMODEEXCLUSIVE)
 			win = glfwCreateWindow(mode->mode.width, mode->mode.height, glGlobals.winTitle, glGlobals.monitor, nil);
@@ -1933,7 +2073,7 @@ startGLFW(void)
 		return 0;
 	}
 
-//	printf("OpenGL version: %s\n", glGetString(GL_VERSION));
+	printf("OpenGL version: %s (%s)\n", glGetString(GL_VERSION), glGetString(GL_RENDERER));
 
 	glGlobals.window = win;
 	*glGlobals.pWindow = win;
@@ -1975,6 +2115,7 @@ initOpenGL(void)
 */
 	gl3Caps.dxtSupported = !!GLAD_GL_EXT_texture_compression_s3tc;
 	gl3Caps.astcSupported = !!GLAD_GL_KHR_texture_compression_astc_ldr;
+	printf("S3TC (DXT) supported: %d\n", (int)gl3Caps.dxtSupported);
 
 	glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT, &gl3Caps.maxAnisotropy);
 

@@ -184,10 +184,11 @@ rasterCreateCameraTexture(Raster *raster)
 
 	natras->autogenMipmap = (raster->format & (Raster::MIPMAP|Raster::AUTOMIPMAP)) == (Raster::MIPMAP|Raster::AUTOMIPMAP);
 
+	natras->scale = hidpiScaleFor(raster->width, raster->height);
 	glGenTextures(1, &natras->texid);
 	uint32 prev = bindTexture(natras->texid);
 	glTexImage2D(GL_TEXTURE_2D, 0, natras->internalFormat,
-	             raster->width, raster->height,
+	             (int32)(raster->width*natras->scale + .5f), (int32)(raster->height*natras->scale + .5f),
 	             0, natras->format, natras->type, nil);
 	natras->filterMode = 0;
 	natras->addressU = 0;
@@ -248,10 +249,11 @@ rasterCreateZbuffer(Raster *raster)
 
 		natras->autogenMipmap = 0;
 
+		natras->scale = hidpiScaleFor(raster->width, raster->height);
 		glGenTextures(1, &natras->texid);
 		uint32 prev = bindTexture(natras->texid);
 		glTexImage2D(GL_TEXTURE_2D, 0, natras->internalFormat,
-			     raster->width, raster->height,
+			     (int32)(raster->width*natras->scale + .5f), (int32)(raster->height*natras->scale + .5f),
 			     0, natras->format, natras->type, nil);
 		natras->filterMode = 0;
 		natras->addressU = 0;
@@ -393,6 +395,7 @@ rasterCreate(Raster *raster)
 	natras->isCompressed = 0;
 	natras->hasAlpha = 0;
 	natras->numLevels = 1;
+	natras->scale = 1.0f;
 
 	Raster *ret = raster;
 
@@ -812,6 +815,7 @@ createNativeRaster(void *object, int32 offset, int32)
 {
 	Gl3Raster *ras = PLUGINOFFSET(Gl3Raster, object, offset);
 	ras->texid = 0;
+	ras->scale = 1.0f;
 	ras->fbo = 0;
 	ras->fboMate = nil;
 	ras->backingStore = nil;

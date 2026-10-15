@@ -1,6 +1,11 @@
 namespace rw {
 namespace gl3 {
 
+// Retina: framebuffer pixels per window point (1 when the framebuffer is not HiDPI), and the same for a raster that
+// is about as large as the window (screen-sized camera textures are allocated in pixels, everything else is not).
+float getHidpiScale(void);
+float hidpiScaleFor(int32 w, int32 h);
+
 #ifdef RW_OPENGL
 
 extern uint32 im2DVbo, im2DIbo;
