@@ -287,10 +287,14 @@ static std::unordered_map<const void*, VelEntry> gVelMap;
 extern "C" { int8_t regtaGfxScaleIdx, regtaGfxTemporal, regtaGfxMetalFX, regtaGfxSSR, regtaGfxRT, regtaGfxRTRoads, regtaGfxRTShadows, regtaGfxPuddles = 1; }
 static const float kScaleTable[6] = { 1.0f, 0.9f, 0.8f, 0.75f, 0.67f, 0.5f };
 // frame cost of the extra graphics passes (milliseconds, smoothed): ray tracing, MetalFX, whole upscale/resolve step
-static float gPerfMs[4];
+static float gPerfMs[6];	// ray tracing, MetalFX, upscale step, scene feed, scene CPU, scene GPU
+static GLuint gSceneQuery[2];
+static int gSceneQi;
+static bool gSceneQueryActive, gSceneQueryHave[2];
+static double gSceneFrameStart;
 static double gCollectAcc;	// time spent registering geometry with the ray tracer this frame
 static inline double perfNow(void){ return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
-extern "C" void regtaPerfGet(float *ms){ ms[0] = gPerfMs[0]; ms[1] = gPerfMs[1]; ms[2] = gPerfMs[2]; ms[3] = gPerfMs[3]; }
+extern "C" void regtaPerfGet(float *ms){ ms[0] = gPerfMs[0]; ms[1] = gPerfMs[1]; ms[2] = gPerfMs[2]; ms[3] = gPerfMs[3]; ms[4] = gPerfMs[4]; ms[5] = gPerfMs[5]; }
 static bool gMetalFX = false;		// re3.ini [Graphics] RenderMetalFX=1: MetalFX temporal scaler instead of the GLSL resolve
 static float gMfxJitterSignX = 1.0f, gMfxJitterSignY = 1.0f;
 static bool gSSR = false;		// vehicles may sample a copy of the scene (screen space reflections)
@@ -2536,6 +2540,24 @@ resolveRenderScale(void)
 	if(!gUseTarget || !gScaledFrame || !rsFbo || !rsCamera) return;
 	gScaledFrame = false;
 	double resolveT0 = perfNow();
+	// how long the scene took: CPU time since the frame began, and GPU time from a timer query (read one frame late)
+	gPerfMs[4] += ((float)(resolveT0 - gSceneFrameStart) - gPerfMs[4])*0.05f;
+	if(gSceneQueryActive){
+		glEndQuery(GL_TIME_ELAPSED);
+		gSceneQueryActive = false;
+		gSceneQueryHave[gSceneQi] = true;
+		int prev = gSceneQi ^ 1;
+		if(gSceneQueryHave[prev]){
+			GLuint avail = 0;
+			glGetQueryObjectuiv(gSceneQuery[prev], GL_QUERY_RESULT_AVAILABLE, &avail);
+			if(avail){
+				GLuint64 ns = 0;
+				glGetQueryObjectui64v(gSceneQuery[prev], GL_QUERY_RESULT, &ns);
+				gPerfMs[5] += ((float)(ns/1.0e6) - gPerfMs[5])*0.05f;
+			}
+		}
+		gSceneQi ^= 1;
+	}
 	if(!rsEasuProg){
 		rsEasuProg = rsCompile(rsVertSrc, rsEasuSrc);
 		rsRcasProg = rsCompile(rsVertSrc, rsRcasSrc);
@@ -3015,6 +3037,11 @@ showRaster(Raster *raster, uint32 flags)
 	}
 	glfwSwapBuffers(glGlobals.window);
 	gScaledFrame = true;
+	gSceneFrameStart = perfNow();
+	if(!gSceneQuery[0]) glGenQueries(2, gSceneQuery);
+	if(gSceneQueryActive){ glEndQuery(GL_TIME_ELAPSED); gSceneQueryActive = false; }
+	glBeginQuery(GL_TIME_ELAPSED, gSceneQuery[gSceneQi]);
+	gSceneQueryActive = true;
 	gPerfMs[3] += ((float)gCollectAcc - gPerfMs[3])*0.05f;
 	gCollectAcc = 0.0;
 	capTaken = false;
