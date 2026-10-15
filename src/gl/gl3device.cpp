@@ -2553,8 +2553,11 @@ clearCamera(Camera *cam, RGBA *col, uint32 mode)
 	if(mode & Camera::CLEARSTENCIL)
 		mask |= GL_STENCIL_BUFFER_BIT;
 	glDepthMask(GL_TRUE);
-	if(gNeedVel && rsVelTex && currentFramebuffer == rsFbo && (mode & Camera::CLEARIMAGE)){
+	static int lastVelClear = -1;
+	if(gNeedVel && rsVelTex && currentFramebuffer == rsFbo && lastVelClear != gFrameIdx){
+		// once per frame, at the first clear (the game may clear only depth, or clear again mid-frame):
 		// motion vectors and reflection directions start at "not written" (alpha 0)
+		lastVelClear = gFrameIdx;
 		static const GLenum bufs[3] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2 };
 		static const float zero[4] = { 0, 0, 0, 0 };
 		int n = rsReflTex ? 3 : 2;
