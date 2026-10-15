@@ -271,7 +271,7 @@ struct VelEntry { float cur[16], prev[16]; int frame; };
 static std::unordered_map<const void*, VelEntry> gVelMap;
 // Graphics options the game's menu changes while running (the menu stores them in re3.ini [Graphics] under the same keys).
 // Index into kScaleTable for the render scale (restart needed for that one).
-extern "C" { int8_t regtaGfxScaleIdx, regtaGfxTemporal, regtaGfxMetalFX, regtaGfxSSR, regtaGfxRT, regtaGfxRTRoads, regtaGfxRTShadows; }
+extern "C" { int8_t regtaGfxScaleIdx, regtaGfxTemporal, regtaGfxMetalFX, regtaGfxSSR, regtaGfxRT, regtaGfxRTRoads, regtaGfxRTShadows, regtaGfxPuddles = 1; }
 static const float kScaleTable[6] = { 1.0f, 0.9f, 0.8f, 0.75f, 0.67f, 0.5f };
 static bool gRTRoadsOn = true;
 static bool gMetalFX = false;		// re3.ini [Graphics] RenderMetalFX=1: MetalFX temporal scaler instead of the GLSL resolve
@@ -1130,6 +1130,7 @@ uploadVelocityUniforms(Shader *s)
 		s->velLoc[2] = glGetUniformLocation(s->program, "u_prevWorld");
 		s->velLoc[3] = glGetUniformLocation(s->program, "u_velOn");
 		s->roadLoc = glGetUniformLocation(s->program, "u_roadWet");
+		s->puddleLoc = glGetUniformLocation(s->program, "u_roadPuddles");
 	}
 	if(s->velFrame != gFrameIdx || s->velScene != gSceneSerial){
 		if(s->velLoc[0] >= 0) glUniformMatrix4fv(s->velLoc[0], 1, GL_FALSE, gCurVP);
@@ -1141,6 +1142,7 @@ uploadVelocityUniforms(Shader *s)
 		if(s->velLoc[2] >= 0) glUniformMatrix4fv(s->velLoc[2], 1, GL_FALSE, gVelPrevWorld);
 		if(s->velLoc[3] >= 0) glUniform1f(s->velLoc[3], gVelOn);
 		if(s->roadLoc >= 0) glUniform1f(s->roadLoc, gVelRoadWet);
+		if(s->puddleLoc >= 0) glUniform1f(s->puddleLoc, regtaGfxPuddles ? 1.0f : 0.0f);
 		s->velObj = gVelObj;
 	}
 }
@@ -3283,7 +3285,9 @@ startGLFW(void)
 				else if(inGraphics && strncmp(line, "RenderScaleIdx=", 15) == 0){
 					int idx = atoi(line + 15);
 					if(idx >= 0 && idx < 6){ gRenderScale = kScaleTable[idx]; regtaGfxScaleIdx = (int8_t)idx; haveScaleIdx = true; }
-				}else if(inGraphics && strncmp(line, "RenderRTRoads=", 14) == 0)
+				}else if(inGraphics && strncmp(line, "RainPuddles=", 12) == 0)
+					regtaGfxPuddles = atoi(line + 12) != 0;
+				else if(inGraphics && strncmp(line, "RenderRTRoads=", 14) == 0)
 					gRTRoadsOn = atoi(line + 14) != 0;
 				else if(inGraphics && strncmp(line, "RenderRTRoadStrength=", 21) == 0)
 					gRTRoadStrength = (float)atof(line + 21);

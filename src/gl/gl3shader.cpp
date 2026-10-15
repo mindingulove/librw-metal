@@ -285,6 +285,7 @@ Shader::create(const char **vsrc, const char **fsrc)
 	}
 	sh->velLoc[0] = sh->velLoc[1] = sh->velLoc[2] = sh->velLoc[3] = -2;
 	sh->roadLoc = -1;
+	sh->puddleLoc = -1;
 	sh->velFrame = sh->velObj = sh->velScene = -1;
 
 #ifdef xxxRW_GLES2

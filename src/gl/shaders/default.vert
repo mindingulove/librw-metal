@@ -7,7 +7,9 @@ VSOUT float v_fog;
 // wet roads: world-space mirror direction and strength for the ray traced reflections (u_roadWet is 0 for everything but roads)
 uniform float u_roadWet;
 VSOUT vec3 v_rrefl;
-VSOUT float v_rw;
+VSOUT float v_rw;		// road wetness (0 for everything but roads)
+VSOUT float v_rfres;	// fresnel term of the viewing angle
+VSOUT vec2 v_rpos;	// world position, for the puddle pattern
 #endif
 
 void
@@ -21,8 +23,9 @@ main(void)
 		vec3 eye = -(transpose(mat3(u_view))*u_view[3].xyz);
 		vec3 V = normalize(eye - Vertex.xyz);
 		v_rrefl = vec3(-V.x, -V.y, V.z);	// mirror about the horizontal road surface
-		float f = pow(1.0 - clamp(V.z, 0.0, 1.0), 4.0);
-		v_rw = u_roadWet*mix(0.12, 0.9, f);
+		v_rfres = pow(1.0 - clamp(V.z, 0.0, 1.0), 4.0);
+		v_rw = u_roadWet;
+		v_rpos = Vertex.xy;
 	}
 #endif
 	vec3 Normal = mat3(u_world) * in_normal;
