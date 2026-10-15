@@ -44,3 +44,52 @@ void WriteVel(void)
 #else
 #define WRITE_VEL()
 #endif
+
+#ifdef WET_SURFACE
+FSIN vec3 v_rrefl;
+FSIN float v_rw;
+FSIN float v_rfres;
+FSIN vec3 v_rpos;
+uniform float u_roadPuddles;	// 1: rain puddles on, 0: only the faint wet film
+layout(location = 2) out vec4 reflOut;
+float wetWeight = 0.0;
+
+float puddleHash(vec2 p)
+{
+	vec3 p3 = fract(vec3(p.xyx)*0.1031);
+	p3 += dot(p3, p3.yzx + 33.33);
+	return fract((p3.x + p3.y)*p3.z);
+}
+
+float puddleNoise(vec2 p)
+{
+	vec2 i = floor(p), f = fract(p);
+	f = f*f*(3.0 - 2.0*f);
+	return mix(mix(puddleHash(i), puddleHash(i + vec2(1.0, 0.0)), f.x),
+	           mix(puddleHash(i + vec2(0.0, 1.0)), puddleHash(i + vec2(1.0, 1.0)), f.x), f.y);
+}
+
+// puddles collect in blobs of a few metres once it rains; they are dark and mirror-like, the rest of the ground only gets a
+// faint film that shows at grazing angles. Any grey, dark, upward facing surface counts as road or pavement.
+void DoWet(inout vec4 color)
+{
+	wetWeight = 0.0;
+	float mx = max(color.r, max(color.g, color.b)), mn = min(color.r, min(color.g, color.b));
+	// face normal from the screen space derivatives of the world position (the map's models carry no normals)
+	vec3 faceN = normalize(cross(dFdx(v_rpos), dFdy(v_rpos)));
+	float up = smoothstep(0.85, 0.95, abs(faceN.z));
+	float surface = up*(1.0 - smoothstep(0.30, 0.55, (mx - mn)/max(mx, 0.01)))*(1.0 - smoothstep(0.6, 0.9, mx));
+	float wetAmount = v_rw*surface;
+	if(wetAmount > 0.001){
+		float n = puddleNoise(v_rpos.xy*0.22)*0.65 + puddleNoise(v_rpos.xy*0.9)*0.35;
+		float puddle = smoothstep(0.55, 0.62, n)*smoothstep(0.25, 0.6, clamp(wetAmount*1.4, 0.0, 1.0))*u_roadPuddles;
+		wetWeight = wetAmount*mix(0.12, 0.9, v_rfres)*0.5 + puddle*1.4;
+		color.rgb *= 1.0 - 0.35*puddle;
+	}
+}
+#define WET_FS(color) DoWet(color)
+#define WRITE_REFL() (reflOut = vec4(normalize(v_rrefl), wetWeight))
+#else
+#define WET_FS(color)
+#define WRITE_REFL()
+#endif

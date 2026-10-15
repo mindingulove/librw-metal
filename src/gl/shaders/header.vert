@@ -138,3 +138,24 @@ VSOUT vec4 v_posPrev;
 #else
 #define VELOCITY_VS(wpos, lpos)
 #endif
+
+#ifdef WET_SURFACE
+// rain: mirror direction, wetness and position for the wet surface code in the fragment shader (u_roadWet is 0 for dynamic objects)
+uniform float u_roadWet;
+VSOUT vec3 v_rrefl;
+VSOUT float v_rw;
+VSOUT float v_rfres;
+VSOUT vec3 v_rpos;
+void WetSetup(vec4 wpos)
+{
+	vec3 wetEye = -(transpose(mat3(u_view))*u_view[3].xyz);
+	vec3 wetV = normalize(wetEye - wpos.xyz);
+	v_rrefl = vec3(-wetV.x, -wetV.y, wetV.z);
+	v_rfres = pow(1.0 - clamp(wetV.z, 0.0, 1.0), 4.0);
+	v_rw = u_roadWet;
+	v_rpos = wpos.xyz;
+}
+#define WET_VS(wpos) WetSetup(wpos)
+#else
+#define WET_VS(wpos)
+#endif
