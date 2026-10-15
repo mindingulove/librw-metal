@@ -296,7 +296,7 @@ static float gJit[2];			// current jitter in target pixels
 static int gFrameIdx;
 static bool gJitterApplied;		// the main camera was jittered this frame
 static bool gHistValid;
-static float gCurVP[16], gPrevVP[16], gInvVP[16];
+static float gCurVP[16], gPrevVP[16], gInvVP[16], gInvVPJit[16];	// gInvVPJit: inverse of the jittered matrix the depth buffer was really rendered with
 
 static void
 mat4mul(float *r, const float *a, const float *b)	// column-major r = a*b
@@ -2363,7 +2363,7 @@ rsRayTracePass(void)
 	gRTEnv.fogDistance = gRTDistance*0.8f;
 	gRTEnv.shadowDistance = gRTShadowDistance;
 	gRTEnv.shadows = gRTShadows ? 1 : 0;
-	bool ok = mrtTrace(gInvVP, &gRTEnv) != 0;
+	bool ok = mrtTrace(gInvVPJit, &gRTEnv) != 0;
 	if(ok){
 		// blend the traced colour over the paint where the vehicle shader marked a reflection
 		glBindFramebuffer(GL_FRAMEBUFFER, rsFbo);
@@ -2732,7 +2732,9 @@ beginUpdate(Camera *cam)
 		mat4mul(vp, proj, view);
 		memcpy(gCurVP, vp, sizeof(vp));
 		gSceneSerial++;
-		if(mat4inv(gInvVP, vp) && gTemporal){
+		bool invOk = mat4inv(gInvVP, vp);
+		memcpy(gInvVPJit, gInvVP, sizeof(gInvVP));
+		if(invOk && gTemporal){
 			// sub-pixel jitter (Halton 2,3) of the projection, in target pixels
 			float sc = getHidpiScale();
 			float tw = cam->frameBuffer->parent->width*sc, th = cam->frameBuffer->parent->height*sc;
@@ -2741,6 +2743,13 @@ beginUpdate(Camera *cam)
 			proj[8] += 2.0f*gJit[0]/tw;
 			proj[9] += 2.0f*gJit[1]/th;
 			gJitterApplied = true;
+			{
+				// positions rebuilt from the depth buffer (ray tracing) must use the same jitter the depth was drawn with, or rays
+				// start a fraction of a pixel off: far away that is enough to flip which polygon a reflection ray hits
+				float vpj[16];
+				mat4mul(vpj, proj, view);
+				if(!mat4inv(gInvVPJit, vpj)) memcpy(gInvVPJit, gInvVP, sizeof(gInvVP));
+			}
 		}
 	}
 	setProjectionMatrix(proj);
