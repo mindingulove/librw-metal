@@ -10,6 +10,7 @@ main(void)
 	vec4 color = v_color*texture(tex0, vec2(v_tex0.x, 1.0-v_tex0.y));
 	WET_FS(color);
 	color.rgb = mix(u_fogColor.rgb, color.rgb, v_fog);
+	GLOSS_FS(color);
 	DoAlphaTest(color.a);
 	WRITE_VEL();
 	WRITE_REFL();

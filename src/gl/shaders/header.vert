@@ -146,6 +146,7 @@ VSOUT vec3 v_rrefl;
 VSOUT float v_rw;
 VSOUT float v_rfres;
 VSOUT vec3 v_rpos;
+VSOUT float v_glossS;	// road gloss: dot of the up vector with the half vector towards the light
 VSOUT vec3 v_rrel;	// position relative to the camera: small numbers, so the surface orientation from derivatives stays exact far away
 void WetSetup(vec4 wpos)
 {
@@ -156,6 +157,7 @@ void WetSetup(vec4 wpos)
 	v_rw = u_roadWet;
 	v_rpos = wpos.xyz;
 	v_rrel = wpos.xyz - wetEye;
+	v_glossS = normalize(wetV - u_lightDirection[0].xyz).z;
 }
 #define WET_VS(wpos) WetSetup(wpos)
 #else

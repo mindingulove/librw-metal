@@ -56,6 +56,9 @@ FSIN float v_rw;
 FSIN float v_rfres;
 FSIN vec3 v_rpos;
 FSIN vec3 v_rrel;
+FSIN float v_glossS;
+uniform sampler2D u_glossTex;	// the neo road gloss texture of this material
+uniform float u_glossMult;	// 0 when the material has none
 uniform float u_roadPuddles;	// 1: rain puddles on, 0: only the faint wet film
 uniform sampler2D u_rtPrev;	// last frame's ray traced reflections (screen space, already softened)
 uniform vec2 u_rtSize;
@@ -123,14 +126,26 @@ void DoWet(inout vec4 color)
 		}
 	}
 }
+// The neo road gloss used to be a second additive pass over every road. Doing it in the same draw halves the road draw calls.
+void DoGloss(inout vec4 color, vec2 uv, float fog)
+{
+	if(u_glossMult > 0.0){
+		float s = v_glossS;
+		float s2 = s*s; s2 *= s2; s2 *= s2;	// ^8
+		color.rgb += texture(u_glossTex, vec2(uv.x, 1.0 - uv.y)).rgb*s2*u_glossMult*fog;
+	}
+}
 #define WET_FS(color) DoWet(color)
+#define GLOSS_FS(color) DoGloss(color, v_tex0, v_fog)
 #define WRITE_REFL() (reflOut = vec4(normalize(v_rrefl)*0.5 + 0.5, clamp(wetWeight, 0.0, 1.0)))	// 8 bit: direction*0.5+0.5, weight
 #elif defined(ZERO_REFL)
 // shaders of things that are not wet ground (characters, other materials) clear the reflection weight under them
 layout(location = 2) out vec4 reflOut;
 #define WET_FS(color)
+#define GLOSS_FS(color)
 #define WRITE_REFL() (reflOut = vec4(0.0))
 #else
 #define WET_FS(color)
+#define GLOSS_FS(color)
 #define WRITE_REFL()
 #endif

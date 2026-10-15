@@ -11,6 +11,7 @@ const char *simple_frag_src =
 "	vec4 color = v_color*texture(tex0, vec2(v_tex0.x, 1.0-v_tex0.y));\n"
 "	WET_FS(color);\n"
 "	color.rgb = mix(u_fogColor.rgb, color.rgb, v_fog);\n"
+"	GLOSS_FS(color);\n"
 "	DoAlphaTest(color.a);\n"
 "	WRITE_VEL();\n"
 "	WRITE_REFL();\n"
