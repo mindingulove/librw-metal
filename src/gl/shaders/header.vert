@@ -126,3 +126,15 @@ float DoFog(float w)
 {
 	return clamp((w - u_fogEnd)*u_fogRange, u_fogDisable, 1.0);
 }
+
+#if defined(HAS_VEL_OUT) && defined(VEL_PIPE)
+// per-object motion vectors for the temporal upscaler (moving objects only: u_velOn)
+uniform mat4 u_vpCur;
+uniform mat4 u_vpPrev;
+uniform mat4 u_prevWorld;
+VSOUT vec4 v_posCur;
+VSOUT vec4 v_posPrev;
+#define VELOCITY_VS(wpos, lpos) { v_posCur = u_vpCur*(wpos); v_posPrev = u_vpPrev*(u_prevWorld*vec4((lpos), 1.0)); }
+#else
+#define VELOCITY_VS(wpos, lpos)
+#endif

@@ -154,6 +154,7 @@ matfxRenderCB(Atomic *atomic, InstanceDataHeader *header)
 {
 	uint32 flags = atomic->geometry->flags;
 	setWorldMatrix(atomic->getFrame()->getLTM());
+	rtCollect(atomic, header);
 	int32 vsBits = lightingCB(atomic);
 
 	setupVertexInput(header);
@@ -199,10 +200,10 @@ matfxOpen(void *o, int32, int32)
 	matFXGlobals.pipelines[PLATFORM_GL3] = makeMatFXPipeline();
 
 #include "shaders/matfx_gl.inc"
-	const char *vs[] = { shaderDecl, header_vert_src, matfx_env_vert_src, nil };
-	const char *vs_fullLight[] = { shaderDecl, "#define DIRECTIONALS\n#define POINTLIGHTS\n#define SPOTLIGHTS\n", header_vert_src, matfx_env_vert_src, nil };
-	const char *fs[] = { shaderDecl, header_frag_src, matfx_env_frag_src, nil };
-	const char *fs_noAT[] = { shaderDecl, "#define NO_ALPHATEST\n", header_frag_src, matfx_env_frag_src, nil };
+	const char *vs[] = { shaderDecl, "#define VEL_PIPE\n", header_vert_src, matfx_env_vert_src, nil };
+	const char *vs_fullLight[] = { shaderDecl, "#define VEL_PIPE\n", "#define DIRECTIONALS\n#define POINTLIGHTS\n#define SPOTLIGHTS\n", header_vert_src, matfx_env_vert_src, nil };
+	const char *fs[] = { shaderDecl, "#define VEL_PIPE\n", header_frag_src, matfx_env_frag_src, nil };
+	const char *fs_noAT[] = { shaderDecl, "#define VEL_PIPE\n", "#define NO_ALPHATEST\n", header_frag_src, matfx_env_frag_src, nil };
 
 	envShader = Shader::create(vs, fs);
 	assert(envShader);

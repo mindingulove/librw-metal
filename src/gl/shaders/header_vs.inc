@@ -127,4 +127,16 @@ const char *header_vert_src =
 "{\n"
 "	return clamp((w - u_fogEnd)*u_fogRange, u_fogDisable, 1.0);\n"
 "}\n"
+
+"#if defined(HAS_VEL_OUT) && defined(VEL_PIPE)\n"
+"// per-object motion vectors for the temporal upscaler (moving objects only: u_velOn)\n"
+"uniform mat4 u_vpCur;\n"
+"uniform mat4 u_vpPrev;\n"
+"uniform mat4 u_prevWorld;\n"
+"VSOUT vec4 v_posCur;\n"
+"VSOUT vec4 v_posPrev;\n"
+"#define VELOCITY_VS(wpos, lpos) { v_posCur = u_vpCur*(wpos); v_posPrev = u_vpPrev*(u_prevWorld*vec4((lpos), 1.0)); }\n"
+"#else\n"
+"#define VELOCITY_VS(wpos, lpos)\n"
+"#endif\n"
 ;

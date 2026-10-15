@@ -83,6 +83,10 @@ struct InstanceData
 	uint32    offset;
 };
 
+struct InstanceDataHeader;
+// ray traced reflections: registers an atomic that is being drawn (see gl3device.cpp)
+void rtCollect(Atomic *atomic, InstanceDataHeader *header);
+
 struct InstanceDataHeader : rw::InstanceDataHeader
 {
 	uint32      serialNumber;

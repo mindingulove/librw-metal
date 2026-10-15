@@ -28,3 +28,19 @@ void DoAlphaTest(float a)
 		discard;
 #endif
 }
+
+#if defined(HAS_VEL_OUT) && defined(VEL_PIPE)
+layout(location = 1) out vec4 velOut;
+FSIN vec4 v_posCur;
+FSIN vec4 v_posPrev;
+uniform float u_velOn;
+void WriteVel(void)
+{
+	vec2 a = v_posCur.xy/v_posCur.w;
+	vec2 b = v_posPrev.xy/v_posPrev.w;
+	velOut = vec4((a - b)*0.5, 0.0, u_velOn);
+}
+#define WRITE_VEL() WriteVel()
+#else
+#define WRITE_VEL()
+#endif

@@ -151,6 +151,8 @@ flushUniforms(void)
 			}
 		currentShader->serialNums[i] = u->serialNum;
 	}
+	if(currentShader->velocity)
+		uploadVelocityUniforms(currentShader);
 }
 
 Shader *currentShader;
@@ -275,6 +277,14 @@ Shader::create(const char **vsrc, const char **fsrc)
 	}
 
 	Shader *sh = rwNewT(Shader, 1, MEMDUR_EVENT | ID_DRIVER);	 // or global?
+	sh->velocity = false;
+	sh->reflection = false;
+	for(const char **p = fsrc; p && *p; p++){
+		if(strstr(*p, "#define VEL_PIPE")) sh->velocity = true;
+		if(strstr(*p, "#define REFL_OUT")) sh->reflection = true;
+	}
+	sh->velLoc[0] = sh->velLoc[1] = sh->velLoc[2] = sh->velLoc[3] = -2;
+	sh->velFrame = sh->velObj = sh->velScene = -1;
 
 #ifdef xxxRW_GLES2
 	int numUniforms;
@@ -342,6 +352,7 @@ Shader::create(const char **vsrc, const char **fsrc)
 void
 Shader::use(void)
 {
+	velocityShaderSelected(this->velocity, this->reflection);
 	if(currentShader != this){
 		glUseProgram(this->program);
 		currentShader = this;

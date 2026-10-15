@@ -54,6 +54,11 @@ struct Shader
 	uint32 *serialNums;
 	int32 numUniforms;	// just to be sure!
 
+	// writes per-object motion vectors (fragment shader calls WRITE_VEL)
+	bool velocity, reflection;
+	GLint velLoc[4];
+	int32 velFrame, velObj, velScene;
+
 	static Shader *create(const char **vsrc, const char **fsrc);
 //	static Shader *fromFiles(const char *vs, const char *fs);
 //	static Shader *fromStrings(const char *vsrc, const char *fsrc);
@@ -62,6 +67,9 @@ struct Shader
 };
 
 extern Shader *currentShader;
+
+void velocityShaderSelected(bool v, bool refl);
+void uploadVelocityUniforms(Shader *s);
 
 }
 }

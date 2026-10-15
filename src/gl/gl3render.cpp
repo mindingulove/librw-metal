@@ -151,6 +151,7 @@ defaultRenderCB(Atomic *atomic, InstanceDataHeader *header)
 
 	uint32 flags = atomic->geometry->flags;
 	setWorldMatrix(atomic->getFrame()->getLTM());
+	rtCollect(atomic, header);
 	int32 vsBits = lightingCB(atomic);
 
 	setupVertexInput(header);
