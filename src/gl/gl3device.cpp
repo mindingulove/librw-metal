@@ -260,12 +260,19 @@ static bool gTemporal = false;
 static GLuint rsFbo, rsVelTex, rsReflTex;	// reduced-size scene target, motion vector attachment, reflection direction attachment
 static int gVelWant = 1, gVelBoth = 1;	// draw buffers the selected shader wants (1 colour, 2 +motion, 3 +reflection) / enabled
 static float gRTStrength = 0.85f, gRTDistance = 250.0f;
-static bool gRT = false;		// re3.ini [Graphics] RenderRT=1: ray traced reflections on vehicles (Metal ray tracing)
+static bool gRT = false;
+static bool gRTShadows = false;			// RenderRTShadows=1: sun shadows traced from the same scene
+static int gRTDiv = 2;				// ray tracing resolution divisor (2 = half resolution, RenderRTHalfRes=0 for full)		// re3.ini [Graphics] RenderRT=1: ray traced reflections on vehicles (Metal ray tracing)
 static bool gNeedVel = false;		// motion vector attachment needed (temporal upscaling or ray tracing)
 static int gVelObj, gSceneSerial;
 static float gVelPrevWorld[16];
 static float gVelOn;
-static float gRoadWet, gVelRoadWet, gRTRoadStrength = 0.7f;	// wetness of the roads (0..1), value for the object being drawn
+static bool gRTRoadsOn = true;
+static float gRoadWet, gVelRoadWet, gRTRoadStrength = 0.7f;
+// which ray traced effects are wanted right now: car reflections, shadows and wet road reflections work on their own
+static inline bool rtWetRoads(void){ return gRTRoadsOn && gRoadWet > 0.05f; }
+static inline bool rtWantsRefl(void){ return gRT || rtWetRoads(); }
+static inline bool rtActive(void){ return gRT || gRTShadows || rtWetRoads(); }	// wetness of the roads (0..1), value for the object being drawn
 extern "C" { int regtaVelocityDynamic; int regtaRoadDraw; }	// set by the game while it draws a moving object / a road
 extern "C" void regtaRTSetWetness(float wet) { gRoadWet = wet; }	// set by the game while it draws a moving object
 struct VelEntry { float cur[16], prev[16]; int frame; };
@@ -274,7 +281,6 @@ static std::unordered_map<const void*, VelEntry> gVelMap;
 // Index into kScaleTable for the render scale (restart needed for that one).
 extern "C" { int8_t regtaGfxScaleIdx, regtaGfxTemporal, regtaGfxMetalFX, regtaGfxSSR, regtaGfxRT, regtaGfxRTRoads, regtaGfxRTShadows, regtaGfxPuddles = 1; }
 static const float kScaleTable[6] = { 1.0f, 0.9f, 0.8f, 0.75f, 0.67f, 0.5f };
-static bool gRTRoadsOn = true;
 // frame cost of the extra graphics passes (milliseconds, smoothed): ray tracing, MetalFX, whole upscale/resolve step
 static float gPerfMs[3];
 static inline double perfNow(void){ return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -342,8 +348,8 @@ applyVelBuffers(void)
 {
 	if(!rsVelTex || currentFramebuffer != rsFbo) return;
 	int want = gVelWant;
-	if(!gTemporal && !gRT) want = 1;			// nothing uses the extra attachments right now
-	else if(want > 2 && (!gRT || !rsReflTex)) want = 2;
+	if(want > 2 && (!rtWantsRefl() || !rsReflTex)) want = 2;
+	if(want == 2 && !gTemporal) want = 1;		// motion vectors only matter for the temporal upscaler
 	if(want == gVelBoth) return;
 	static const GLenum bufs[3] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2 };
 	gVelBoth = want;
@@ -2019,7 +2025,6 @@ int mrtTrace(const float *invViewProj, const RtEnv *env);
 }
 
 static RtEnv gRTEnv = { {0.3f,0.5f,0.9f}, {0.7f,0.8f,0.9f}, {0.3f,0.3f,0.3f}, {0,0,-1}, {0.6f,0.6f,0.5f}, 250.0f, 200.0f, {0,0,1}, 0.0f, 120.0f, 0 };
-static bool gRTShadows = false;			// RenderRTShadows=1: sun shadows traced from the same scene
 static float gRTShadowStrength = 0.55f, gRTShadowDistance = 120.0f;
 
 // called by the game every frame: unit vector to the sun and how strongly the sun lights the scene (0 at night)
@@ -2082,7 +2087,7 @@ rtTextureColour(Texture *tex, float *rgb)
 void
 rtCollect(Atomic *atomic, InstanceDataHeader*)
 {
-	if(!gRT || !gScaledFrame || !rsCamera || engine->currentCamera != rsCamera) return;
+	if(!rtActive() || !gScaledFrame || !rsCamera || engine->currentCamera != rsCamera) return;
 	if(gRTLastFrame != (uint32)gFrameIdx){
 		gRTLastFrame = (uint32)gFrameIdx;
 		if(mrtReady()) mrtFrameBegin();
@@ -2099,7 +2104,7 @@ rtCollect(Atomic *atomic, InstanceDataHeader*)
 		std::vector<std::vector<uint32_t> > lists(mh->numMeshes);
 		std::vector<const uint32_t*> ptrs(mh->numMeshes);
 		std::vector<int> counts(mh->numMeshes);
-		std::vector<float> colours(mh->numMeshes*3);
+		std::vector<float> colours(mh->numMeshes*6);
 		std::vector<int> meshCasts(mh->numMeshes, 1);	// alpha tested / blended meshes (leaves, fences, glass) would cast solid shadows
 		bool groundLike = false;
 		Mesh *meshes = mh->getMeshes();
@@ -2128,9 +2133,17 @@ rtCollect(Atomic *atomic, InstanceDataHeader*)
 			if(mc.alpha < 255) meshCasts[m] = 0;
 			if(me->material && me->material->texture && me->material->texture->raster &&
 			   PLUGINOFFSET(Gl3Raster, me->material->texture->raster, nativeRasterOffset)->hasAlpha) meshCasts[m] = 0;
-			colours[m*3+0] = tc[0]*mc.red/255.0f;
-			colours[m*3+1] = tc[1]*mc.green/255.0f;
-			colours[m*3+2] = tc[2]*mc.blue/255.0f;
+			colours[m*6+0] = tc[0]*mc.red/255.0f;
+			colours[m*6+1] = tc[1]*mc.green/255.0f;
+			colours[m*6+2] = tc[2]*mc.blue/255.0f;
+			// average prelit vertex light of the mesh (baked day light of map models); non-prelit geometry is lit by the game's lights
+			float pl[3] = { 0.4f, 0.4f, 0.4f };
+			if((g->flags & Geometry::PRELIT) && g->colors && L.size() >= 3){
+				double sum[3] = { 0, 0, 0 };
+				for(uint32_t v : L){ sum[0] += g->colors[v].red; sum[1] += g->colors[v].green; sum[2] += g->colors[v].blue; }
+				for(int k = 0; k < 3; k++) pl[k] = (float)(sum[k]/(L.size()*255.0));
+			}
+			colours[m*6+3] = pl[0]; colours[m*6+4] = pl[1]; colours[m*6+5] = pl[2];
 		}
 		if(!bad && !regtaVelocityDynamic){
 			// ground-like meshes (roads, pavements, grass, terrain) must not cast shadows: they lie on or just under the surfaces
@@ -2170,12 +2183,23 @@ static const char *rsRTPrepSrc =
 "#version 330\n"
 "uniform sampler2D depthTex;\n"
 "uniform sampler2D reflTex;\n"
+"uniform int div;\n"
 "layout(location = 0) out vec4 oDepth;\n"
 "layout(location = 1) out vec4 oDir;\n"
 "void main(){\n"
-"	ivec2 p = ivec2(gl_FragCoord.xy);\n"
-"	oDepth = vec4(texelFetch(depthTex, p, 0).r, 0.0, 0.0, 1.0);\n"
-"	oDir = texelFetch(reflTex, p, 0);\n"
+"	ivec2 hi = textureSize(depthTex, 0) - 1;\n"
+"	ivec2 base = ivec2(gl_FragCoord.xy)*div;\n"
+"	// one sample per div x div block: keep the pixel with the strongest reflection (thin marked parts must not vanish)\n"
+"	vec4 best = vec4(0.0);\n"
+"	ivec2 bp = clamp(base, ivec2(0), hi);\n"
+"	for(int y = 0; y < div; y++)\n"
+"	for(int x = 0; x < div; x++){\n"
+"		ivec2 q = clamp(base + ivec2(x, y), ivec2(0), hi);\n"
+"		vec4 d = texelFetch(reflTex, q, 0);\n"
+"		if(d.w > best.w){ best = d; bp = q; }\n"
+"	}\n"
+"	oDepth = vec4(texelFetch(depthTex, bp, 0).r, 0.0, 0.0, 1.0);\n"
+"	oDir = best;\n"
 "}\n";
 
 static const char *rsRTCompositeSrc =
@@ -2183,23 +2207,30 @@ static const char *rsRTCompositeSrc =
 "uniform sampler2DRect rtTex;\n"
 "uniform sampler2D reflTex;\n"
 "uniform float strength;\n"
+"uniform int div;\n"
 "out vec4 fragColor;\n"
 "void main(){\n"
 "	ivec2 p = ivec2(gl_FragCoord.xy);\n"
 "	float w = texelFetch(reflTex, p, 0).a;\n"
 "	if(w <= 0.001) discard;\n"
 "	// soften the traced image a little (ripples, and the reflected colours are only per-material averages)\n"
-"	vec4 r = texelFetch(rtTex, p)*0.36;\n"
-"	r += texelFetch(rtTex, p + ivec2(2, 0))*0.16 + texelFetch(rtTex, p - ivec2(2, 0))*0.16;\n"
-"	r += texelFetch(rtTex, p + ivec2(0, 2))*0.16 + texelFetch(rtTex, p - ivec2(0, 2))*0.16;\n""	fragColor = vec4(r.rgb, clamp(w*strength, 0.0, 1.0));\n"
+"	ivec2 hi = textureSize(rtTex) - 1;\n"
+"	ivec2 c = clamp(p/div, ivec2(0), hi);\n"
+"	int o = max(1, 2/div);\n"
+"	vec4 r = texelFetch(rtTex, c)*0.36;\n"
+"	r += texelFetch(rtTex, clamp(c + ivec2(o, 0), ivec2(0), hi))*0.16 + texelFetch(rtTex, clamp(c - ivec2(o, 0), ivec2(0), hi))*0.16;\n"
+"	r += texelFetch(rtTex, clamp(c + ivec2(0, o), ivec2(0), hi))*0.16 + texelFetch(rtTex, clamp(c - ivec2(0, o), ivec2(0), hi))*0.16;\n"
+"	fragColor = vec4(r.rgb, clamp(w*strength, 0.0, 1.0));\n"
 "}\n";
 
 static const char *rsRTShadowSrc =
 "#version 330\n"
 "uniform sampler2DRect shadowTex;\n"
 "uniform sampler2DRect depthRect;\n"
+"uniform sampler2D depthFull;\n"
 "uniform float strength;\n"
 "uniform vec2 nearFar;\n"
+"uniform int div;\n"
 "out vec4 fragColor;\n"
 "float lin(float d){\n"
 "	float z = d*2.0 - 1.0;\n"
@@ -2208,16 +2239,18 @@ static const char *rsRTShadowSrc =
 "void main(){\n"
 "	ivec2 p = ivec2(gl_FragCoord.xy);\n"
 "	ivec2 hi = textureSize(depthRect) - 1;\n"
-"	float dc = texelFetch(depthRect, p).r;\n"
+"	float dc = texelFetch(depthFull, p, 0).r;\n"
 "	if(dc >= 0.99999) discard;\n"
 "	float lc = lin(dc);\n"
 "	// depth aware blur: the shadow rays are noisy (one ray per pixel), so smooth between pixels of the same surface\n"
 "	float sum = 0.0, ws = 0.0;\n"
+"	ivec2 c = p/div;\n"
+"	float sigma = div > 1 ? 0.45 : 0.2;\n"
 "	for(int y = -2; y <= 2; y++)\n"
 "	for(int x = -2; x <= 2; x++){\n"
-"		ivec2 q = clamp(p + ivec2(x, y), ivec2(0), hi);\n"
+"		ivec2 q = clamp(c + ivec2(x, y), ivec2(0), hi);\n"
 "		float lq = lin(texelFetch(depthRect, q).r);\n"
-"		float w = exp(-float(x*x + y*y)*0.2)*exp(-abs(lq - lc)/(0.03*lc + 0.05));\n"
+"		float w = exp(-float(x*x + y*y)*sigma)*exp(-abs(lq - lc)/(0.03*lc + 0.05));\n"
 "		sum += texelFetch(shadowTex, q).r*w;\n"
 "		ws += w;\n"
 "	}\n"
@@ -2243,7 +2276,7 @@ rsRTLog(const char *msg)
 static void
 rsRayTracePass(void)
 {
-	if(!gRT || rsRTFailed || !rsReflTex || !rsFbo || !rsCamera || !rsCamera->zBuffer) return;
+	if(!rtActive() || rsRTFailed || !rsReflTex || !rsFbo || !rsCamera || !rsCamera->zBuffer) return;
 	if(!mrtReady() || rsRTSize[0] != rsW || rsRTSize[1] != rsH){
 		if(!rsRTPrepProg){
 			rsRTPrepProg = rsCompile(rsVertSrc, rsRTPrepSrc);
@@ -2252,7 +2285,7 @@ rsRayTracePass(void)
 			if(!rsRTPrepProg || !rsRTCompProg || !rsRTShadowProg){ rsRTLog("shader compile failed, ray tracing off"); rsRTFailed = true; return; }
 		}
 		gRTGeom.clear();
-		if(!mrtSetup(rsW, rsH, rsRTTex)){ rsRTLog("setup failed, ray tracing off"); rsRTFailed = true; return; }
+		if(!mrtSetup((rsW + gRTDiv - 1)/gRTDiv, (rsH + gRTDiv - 1)/gRTDiv, rsRTTex)){ rsRTLog("setup failed, ray tracing off"); rsRTFailed = true; return; }
 		GLint prevFbo;
 		glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
 		if(!rsRTFbo) glGenFramebuffers(1, &rsRTFbo);
@@ -2268,12 +2301,12 @@ rsRayTracePass(void)
 		return;	// geometry is registered from now on; first traced frame is the next one
 	}
 	Gl3Raster *natzb = PLUGINOFFSET(Gl3Raster, rsCamera->zBuffer->parent, nativeRasterOffset);
-	GLint prevTex0, prevTex1, prevRect0, prevRect1;
+	GLint prevTex0, prevTex1, prevRect0, prevRect1, prevTex2 = -1;
 	glActiveTexture(GL_TEXTURE0); glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex0); glGetIntegerv(GL_TEXTURE_BINDING_RECTANGLE, &prevRect0);
 	glActiveTexture(GL_TEXTURE1); glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex1); glGetIntegerv(GL_TEXTURE_BINDING_RECTANGLE, &prevRect1);
 
 	glBindFramebuffer(GL_FRAMEBUFFER, rsRTFbo);
-	glViewport(0, 0, rsW, rsH);
+	glViewport(0, 0, (rsW + gRTDiv - 1)/gRTDiv, (rsH + gRTDiv - 1)/gRTDiv);
 	glUseProgram(rsRTPrepProg);
 	glActiveTexture(GL_TEXTURE0);
 	glBindTexture(GL_TEXTURE_2D, natzb->texid);
@@ -2283,6 +2316,7 @@ rsRayTracePass(void)
 	glBindTexture(GL_TEXTURE_2D, rsReflTex);
 	glUniform1i(glGetUniformLocation(rsRTPrepProg, "depthTex"), 0);
 	glUniform1i(glGetUniformLocation(rsRTPrepProg, "reflTex"), 1);
+	glUniform1i(glGetUniformLocation(rsRTPrepProg, "div"), gRTDiv);
 	glDrawArrays(GL_TRIANGLES, 0, 3);
 	glFinish();
 
@@ -2298,17 +2332,20 @@ rsRayTracePass(void)
 		glDrawBuffers(1, b0);
 		gVelBoth = 1;
 		glViewport(0, 0, rsW, rsH);
-		glUseProgram(rsRTCompProg);
-		glActiveTexture(GL_TEXTURE0);
-		glBindTexture(GL_TEXTURE_RECTANGLE, rsRTTex[2]);
-		glActiveTexture(GL_TEXTURE1);
-		glBindTexture(GL_TEXTURE_2D, rsReflTex);
-		glUniform1i(glGetUniformLocation(rsRTCompProg, "rtTex"), 0);
-		glUniform1i(glGetUniformLocation(rsRTCompProg, "reflTex"), 1);
-		glUniform1f(glGetUniformLocation(rsRTCompProg, "strength"), gRTStrength);
 		glEnable(GL_BLEND);
-		glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-		glDrawArrays(GL_TRIANGLES, 0, 3);
+		if(rtWantsRefl()){
+			glUseProgram(rsRTCompProg);
+			glActiveTexture(GL_TEXTURE0);
+			glBindTexture(GL_TEXTURE_RECTANGLE, rsRTTex[2]);
+			glActiveTexture(GL_TEXTURE1);
+			glBindTexture(GL_TEXTURE_2D, rsReflTex);
+			glUniform1i(glGetUniformLocation(rsRTCompProg, "rtTex"), 0);
+			glUniform1i(glGetUniformLocation(rsRTCompProg, "reflTex"), 1);
+			glUniform1i(glGetUniformLocation(rsRTCompProg, "div"), gRTDiv);
+			glUniform1f(glGetUniformLocation(rsRTCompProg, "strength"), gRTStrength);
+			glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+			glDrawArrays(GL_TRIANGLES, 0, 3);
+		}
 		if(gRTShadows && gRTEnv.sunVisibility > 0.01f){
 			// darken the scene where the sun rays were blocked
 			glUseProgram(rsRTShadowProg);
@@ -2316,7 +2353,12 @@ rsRayTracePass(void)
 			glBindTexture(GL_TEXTURE_RECTANGLE, rsRTTex[3]);
 			glActiveTexture(GL_TEXTURE1);
 			glBindTexture(GL_TEXTURE_RECTANGLE, rsRTTex[0]);
+			glActiveTexture(GL_TEXTURE2);
+			glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex2);
+			glBindTexture(GL_TEXTURE_2D, natzb->texid);
 			glActiveTexture(GL_TEXTURE0);
+			glUniform1i(glGetUniformLocation(rsRTShadowProg, "depthFull"), 2);
+			glUniform1i(glGetUniformLocation(rsRTShadowProg, "div"), gRTDiv);
 			glUniform1i(glGetUniformLocation(rsRTShadowProg, "shadowTex"), 0);
 			glUniform1i(glGetUniformLocation(rsRTShadowProg, "depthRect"), 1);
 			glUniform2f(glGetUniformLocation(rsRTShadowProg, "nearFar"), rsCamera->nearPlane, rsCamera->farPlane);
@@ -2326,6 +2368,7 @@ rsRayTracePass(void)
 		}
 		glDisable(GL_BLEND);
 	}
+	if(prevTex2 >= 0){ glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, prevTex2); }
 	glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, prevTex1); glBindTexture(GL_TEXTURE_RECTANGLE, prevRect1);
 	glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, prevTex0); glBindTexture(GL_TEXTURE_RECTANGLE, prevRect0);
 }
@@ -3295,6 +3338,8 @@ startGLFW(void)
 					gRT = atoi(line + 9) != 0;
 				else if(inGraphics && strncmp(line, "RenderRTStrength=", 17) == 0)
 					gRTStrength = (float)atof(line + 17);
+				else if(inGraphics && strncmp(line, "RenderRTHalfRes=", 16) == 0)
+					gRTDiv = atoi(line + 16) ? 2 : 1;
 				else if(inGraphics && strncmp(line, "RenderRTShadows=", 16) == 0)
 					gRTShadows = atoi(line + 16) != 0;
 				else if(inGraphics && strncmp(line, "RenderRTShadowStrength=", 23) == 0)
