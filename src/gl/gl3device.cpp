@@ -2280,7 +2280,7 @@ static const char *rsRTShadowSrc =
 "		ws += w;\n"
 "	}\n"
 "	float s = sum/max(ws, 1e-4);\n"
-"	s *= 1.0 - clamp(puddleW*2.5, 0.0, 1.0);\n"
+"	s *= 1.0 - clamp(puddleW*8.0, 0.0, 1.0);\n"
 "	if(s <= 0.004) discard;\n"
 "	fragColor = dbg > 0.5 ? vec4(0.0, 1.0, 0.0, clamp(s*2.0, 0.0, 1.0)) : vec4(vec3(1.0 - s*strength), 1.0);\n"
 "}\n";
