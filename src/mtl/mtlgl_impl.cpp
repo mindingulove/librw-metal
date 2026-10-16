@@ -771,6 +771,8 @@ typeSize(GLenum t)
 // draw
 
 static id<MTLBuffer> zeroAttribBuf = nil;
+// buffer slot of the constant (0, 0, 0, 1) that disabled attributes read; 15 is the uniform block, 1..8 are vertex buffers
+static const int kZeroSlot = 14;
 
 static id<MTLDepthStencilState>
 depthStencilState(bool hasDepth, bool hasStencil)
@@ -884,7 +886,7 @@ drawCommon(GLenum mode, GLsizei count, GLenum idxType, size_t idxOff, bool index
 		Buf *b = a.enabled ? bufOf(a.buffer) : nullptr;
 		if(!b || !b->buf){
 			// disabled attribute: OpenGL supplies (0, 0, 0, 1)
-			key.a[key.nAttr++] = { (uint8_t)MTLVertexFormatFloat4, 15, 0 };
+			key.a[key.nAttr++] = { (uint8_t)MTLVertexFormatFloat4, kZeroSlot, 0 };
 			needZero = true;
 			continue;
 		}
@@ -962,11 +964,11 @@ drawCommon(GLenum mode, GLsizei count, GLenum idxType, size_t idxOff, bool index
 			vd.layouts[s].stepFunction = MTLVertexStepFunctionPerVertex;
 		}
 		bool usesZero = false;
-		for(int i = 0; i < key.nAttr; i++) if(key.a[i].slot == 15) usesZero = true;
+		for(int i = 0; i < key.nAttr; i++) if(key.a[i].slot == kZeroSlot) usesZero = true;
 		if(usesZero){
-			vd.layouts[15].stride = 16;
-			vd.layouts[15].stepFunction = MTLVertexStepFunctionConstant;
-			vd.layouts[15].stepRate = 0;
+			vd.layouts[kZeroSlot].stride = 16;
+			vd.layouts[kZeroSlot].stepFunction = MTLVertexStepFunctionConstant;
+			vd.layouts[kZeroSlot].stepRate = 0;
 		}
 		d.vertexDescriptor = vd;
 		for(int i = 0; i < 4; i++){
@@ -1039,8 +1041,8 @@ drawCommon(GLenum mode, GLsizei count, GLenum idxType, size_t idxOff, bool index
 			float z[4] = { 0, 0, 0, 1 };
 			zeroAttribBuf = [G->dev newBufferWithBytes:z length:sizeof(z) options:MTLResourceStorageModeShared];
 		}
-		[enc setVertexBuffer:zeroAttribBuf offset:0 atIndex:15];
-		es.vbuf[15] = nil;
+		[enc setVertexBuffer:zeroAttribBuf offset:0 atIndex:kZeroSlot];
+		es.vbuf[kZeroSlot] = nil;
 	}
 
 	if(dbgOn()){
