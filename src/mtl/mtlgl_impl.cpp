@@ -41,6 +41,8 @@ static void logf_(const char *fmt, ...)
 	va_end(ap);
 }
 
+static bool dbgOn(void){ static int on = getenv("REGTA_MTLGL_LOG") ? 1 : 0; return on != 0; }
+
 // ---------------------------------------------------------------------------------------------------------
 // objects
 
@@ -71,6 +73,9 @@ struct Tex {
 	float aniso = 1.0f;
 	uint64_t lastUse = 0;
 	int created = 0;	// levels of mtl
+	bool uploaded = false;	// some pixel data reached the Metal texture (or it is a render target)
+	bool warned = false;
+	GLuint name = 0;
 };
 
 struct Rb { id<MTLTexture> mtl = nil; int w = 0, h = 0; GLenum fmt = 0; };
@@ -442,6 +447,7 @@ fullLevels(int w, int h)
 static void
 uploadLevel(Tex *t, int level, const void *bytes, size_t rowBytes, int w, int h)
 {
+	t->uploaded = true;
 	if(t->lastUse != 0 && t->lastUse > G->completed.load()){
 		// the GPU may still read this texture: go through a staging buffer and a blit
 		size_t total = rowBytes*(size_t)(t->compressed ? (h + 3)/4 : h);
@@ -486,6 +492,11 @@ ensureTex(Tex *t)
 	if(!t->mtl){ logf_("texture creation failed %dx%d fmt %d", t->w, t->h, (int)t->fmt); return false; }
 	t->created = n;
 	t->lastUse = 0;
+	if(dbgOn()){
+		int withData = 0;
+		for(auto &l : t->lv) if(!l.data.empty()) withData++;
+		logf_("tex %u created ifmt=0x%x %dx%d levels=%d specified=%d withData=%d gen=%d maxLevel=%d", t->name, t->ifmt, t->w, t->h, n, specified, withData, (int)t->genMips, t->maxLevel);
+	}
 	if(!t->depth){
 		bool any = false;
 		for(int i = 0; i < n && i < (int)t->lv.size(); i++){
@@ -495,6 +506,7 @@ ensureTex(Tex *t)
 				levelBytes(t->fmt, l.w, l.h, &rb);
 				[t->mtl replaceRegion:MTLRegionMake2D(0, 0, l.w, l.h) mipmapLevel:i withBytes:l.data.data() bytesPerRow:rb];
 				std::vector<uint8_t>().swap(l.data);
+				t->uploaded = true;
 				if(i == 0) any = true;
 			}
 		}
@@ -557,6 +569,7 @@ attachTexture(Attach &a)
 	if(a.tex){
 		if(!ensureTex(a.tex)) return nil;
 		a.tex->lastUse = G->serial;
+		a.tex->uploaded = true;
 		return a.tex->mtl;
 	}
 	if(a.rb) return a.rb->mtl;
@@ -1013,7 +1026,7 @@ drawCommon(GLenum mode, GLsizei count, GLenum idxType, size_t idxOff, bool index
 		if(unit < 0 || unit > 15) unit = 0;
 		Tex *t = i < 16 ? sampled[i] : nullptr;
 		id<MTLTexture> mt = nil; id<MTLSamplerState> ss = nil;
-		if(t){ mt = t->mtl; t->lastUse = G->serial; ss = samplerFor(t); }
+		if(t){ mt = t->mtl; t->lastUse = G->serial; ss = samplerFor(t); if(!t->uploaded && !t->warned && dbgOn()){ t->warned = true; logf_("prog %u samples never-uploaded tex %u ifmt=0x%x %dx%d", (unsigned)G->prog, t->name, t->ifmt, t->w, t->h); } }
 		if(!mt){
 			if(!G->blackTex){
 				MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:1 height:1 mipmapped:NO];
@@ -1263,7 +1276,7 @@ MGL void mgl_glVertexAttribPointer(GLuint i, GLint size, GLenum type, GLboolean 
 }
 
 // ---- textures
-MGL void mgl_glGenTextures(GLsizei n, GLuint *ids){ for(int i = 0; i < n; i++) ids[i] = addObj(G->texs, new Tex()); }
+MGL void mgl_glGenTextures(GLsizei n, GLuint *ids){ for(int i = 0; i < n; i++){ ids[i] = addObj(G->texs, new Tex()); G->texs[ids[i]]->name = ids[i]; } }
 MGL void mgl_glDeleteTextures(GLsizei n, const GLuint *ids){
 	for(int i = 0; i < n; i++) if(ids[i] && ids[i] < G->texs.size() && G->texs[ids[i]]){
 		for(int u = 0; u < 16; u++){ if(G->unitTex2D[u] == ids[i]) G->unitTex2D[u] = 0; if(G->unitTexRect[u] == ids[i]) G->unitTexRect[u] = 0; }
@@ -1316,6 +1329,7 @@ static void texImage(Tex *t, int level, GLenum ifmt, int w, int h, GLenum format
 	std::vector<uint8_t> px;
 	if(compressedSize) px.assign((const uint8_t*)data, (const uint8_t*)data + compressedSize);
 	else convertPixels(t->fmt, format, type, w, h, data, px);
+	if(dbgOn() && t->mtl && level >= t->created) logf_("tex %u late level %d (created %d)", t->name, level, t->created);
 	if(t->mtl && level < t->created){
 		size_t rb;
 		levelBytes(t->fmt, w, h, &rb);
