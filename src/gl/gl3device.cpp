@@ -2387,6 +2387,8 @@ rsRTLog(const char *msg)
 }
 
 // true while ray traced reflections work: the game can then refresh its (expensive) environment map rarely
+// the traced sun shadows are drawn this frame (the game's own blob shadows of cars, peds and poles are then left out)
+extern "C" int regtaRTShadowsVisible(void){ return (gRTShadows && regtaGfxRTShadows && !rsRTFailed && mrtReady() && gShadowStrengthNow > 0.05f) ? 1 : 0; }
 extern "C" int regtaRTReflectionsActive(void){ return (gRT && !rsRTFailed && mrtReady()) ? 1 : 0; }
 
 // Traces reflections for the pixels the vehicle shader marked and blends the result into the scene colour.
