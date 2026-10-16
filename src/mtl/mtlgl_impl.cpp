@@ -79,6 +79,7 @@ struct Tex {
 	float aniso = 1.0f;
 	uint64_t lastUse = 0;
 	int created = 0;	// levels of mtl
+	uint32_t sampKey = ~0u; id<MTLSamplerState> samp = nil;	// last sampler state of this texture
 	bool uploaded = false;	// some pixel data reached the Metal texture (or it is a render target)
 	bool warned = false;
 	GLuint name = 0;
@@ -570,8 +571,9 @@ static id<MTLSamplerState>
 samplerFor(Tex *t)
 {
 	uint32_t k = samplerKey(t);
+	if(t->samp && t->sampKey == k) return t->samp;
 	auto it = G->samplers.find(k);
-	if(it != G->samplers.end()) return it->second;
+	if(it != G->samplers.end()){ t->sampKey = k; t->samp = it->second; return it->second; }
 	MTLSamplerDescriptor *d = [MTLSamplerDescriptor new];
 	d.minFilter = (k & 1) ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
 	d.magFilter = (k & 2) ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
@@ -584,6 +586,7 @@ samplerFor(Tex *t)
 	d.maxAnisotropy = (k >> 8) & 31;
 	id<MTLSamplerState> s = [G->dev newSamplerStateWithDescriptor:d];
 	G->samplers[k] = s;
+	t->sampKey = k; t->samp = s;
 	return s;
 }
 
@@ -822,8 +825,10 @@ depthStencilState(bool hasDepth, bool hasStencil)
 	k.sFunc = (uint8_t)(G->sFunc - GL_NEVER);
 	k.sFail = (uint8_t)(G->sFail & 0xff); k.sZFail = (uint8_t)(G->sZFail & 0xff); k.sPass = (uint8_t)(G->sPass & 0xff);
 	k.sMask = (uint8_t)G->sMask; k.sWrite = (uint8_t)G->sWrite;
+	static DsKey lastK; static id<MTLDepthStencilState> lastS = nil;
+	if(lastS && lastK == k) return lastS;
 	auto it = G->dss.find(k);
-	if(it != G->dss.end()) return it->second;
+	if(it != G->dss.end()){ lastK = k; lastS = it->second; return it->second; }
 	auto cmp = [](GLenum f){
 		switch(f){ case GL_NEVER: return MTLCompareFunctionNever; case GL_LESS: return MTLCompareFunctionLess; case GL_EQUAL: return MTLCompareFunctionEqual;
 		case GL_LEQUAL: return MTLCompareFunctionLessEqual; case GL_GREATER: return MTLCompareFunctionGreater; case GL_NOTEQUAL: return MTLCompareFunctionNotEqual;
@@ -978,8 +983,10 @@ drawCommon(GLenum mode, GLsizei count, GLenum idxType, size_t idxOff, bool index
 	key.flip = 1;
 
 	id<MTLRenderPipelineState> pso;
-	auto it = G->psos.find(key);
-	if(it != G->psos.end()) pso = it->second;
+	static PsoKey lastKey; static id<MTLRenderPipelineState> lastPso = nil;
+	auto it = (lastPso && lastKey == key) ? G->psos.end() : G->psos.find(key);
+	if(lastPso && lastKey == key) pso = lastPso;
+	else if(it != G->psos.end()) pso = it->second;
 	else{
 		MTLFunctionConstantValues *fc = [MTLFunctionConstantValues new];
 		bool flip = true;
@@ -1029,6 +1036,7 @@ drawCommon(GLenum mode, GLsizei count, GLenum idxType, size_t idxOff, bool index
 		G->psos[key] = pso;
 	}
 	if(!pso) return;
+	lastKey = key; lastPso = pso;
 
 	id<MTLRenderCommandEncoder> enc = G->enc;
 	Ctx::EncState &es = G->es;
