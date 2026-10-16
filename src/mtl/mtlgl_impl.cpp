@@ -1001,6 +1001,28 @@ drawCommon(GLenum mode, GLsizei count, GLenum idxType, size_t idxOff, bool index
 		es.vbuf[15] = nil;
 	}
 
+	if(dbgOn()){
+		static int logged = 0;
+		auto it1 = p->byName.find("u_ambLight");
+		if(it1 != p->byName.end() && logged < 400 && (G->prog % 1) == 0){
+			static std::unordered_map<GLuint,int> perProg;
+			if(perProg[G->prog]++ < 6){
+				logged++;
+				auto get = [&](const char *n, int idx, float *out){
+					auto it = p->byName.find(n);
+					out[0] = out[1] = out[2] = out[3] = -99;
+					if(it == p->byName.end()) return;
+					int off = p->uniforms[it->second].vsOff;
+					if(off >= 0 && (size_t)off + 16*(idx + 1) <= p->vsBlock.size()) memcpy(out, &p->vsBlock[off + 16*idx], 16);
+				};
+				float amb[4], mc[4], sp[4], lp[4], lc[4], ld[4];
+				get("u_ambLight", 0, amb); get("u_matColor", 0, mc); get("u_surfProps", 0, sp);
+				get("u_lightParams", 0, lp); get("u_lightColor", 0, lc); get("u_lightDirection", 0, ld);
+				logf_("draw prog %u amb %.2f %.2f %.2f %.2f | matColor %.2f %.2f %.2f %.2f | surf %.2f %.2f %.2f %.2f | lp0 %.1f lc0 %.2f %.2f %.2f ld0 %.2f %.2f %.2f",
+				      (unsigned)G->prog, amb[0], amb[1], amb[2], amb[3], mc[0], mc[1], mc[2], mc[3], sp[0], sp[1], sp[2], sp[3], lp[0], lc[0], lc[1], lc[2], ld[0], ld[1], ld[2]);
+			}
+		}
+	}
 	// ---- uniforms
 	if(!p->vsBlock.empty() && (es.progId[0] != G->prog || es.progVer[0] != p->version)){
 		if(p->vsBlock.size() <= 4096)
