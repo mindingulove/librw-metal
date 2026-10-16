@@ -28,6 +28,18 @@
 #define GLFW_EXPOSE_NATIVE_COCOA
 #include <GLFW/glfw3native.h>
 #include "../mtl/mtlgl.h"
+// Without an OpenGL context GLFW always reports the Retina pixel size; follow re3.ini Retina= like the OpenGL build does
+static bool gMetalRetina = false;
+static void
+metalFramebufferSize(GLFWwindow *w, int *fw, int *fh)
+{
+	int ww, wh;
+	glfwGetWindowSize(w, &ww, &wh);
+	float sx = 1.0f, sy = 1.0f;
+	if(gMetalRetina) glfwGetWindowContentScale(w, &sx, &sy);
+	*fw = (int)(ww*sx + 0.5f); *fh = (int)(wh*sy + 0.5f);
+}
+#define glfwGetFramebufferSize metalFramebufferSize
 #endif
 
 namespace rw {
@@ -3664,6 +3676,9 @@ startGLFW(void)
 			fclose(ini);
 		}
 		glfwWindowHint(GLFW_COCOA_RETINA_FRAMEBUFFER, retina ? GLFW_TRUE : GLFW_FALSE);
+#ifdef RW_METALGL
+		gMetalRetina = retina;
+#endif
 	}
 #endif
 	glfwWindowHint(GLFW_RED_BITS, mode->mode.redBits);
