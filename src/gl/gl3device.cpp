@@ -287,6 +287,7 @@ static int gVelObj, gSceneSerial;
 static float gVelPrevWorld[16];
 static float gVelOn;
 static bool gRTRoadsOn = true;
+static bool gCoverNow;			// the traced image also says which ground is under a roof (b channel: no puddles there)
 static float gShadowStrengthNow;			// strength of the traced shadow now (0 when off), set by the ray tracing pass
 static GLuint gShadowOutTex;			// last traced shadow image
 static GLuint gRTOutTex;				// last traced reflection image (rectangle texture), read by the ground shaders next frame
@@ -1198,7 +1199,8 @@ uploadVelocityUniforms(Shader *s)
 		if(s->rtLoc[1] >= 0) glUniform2f(s->rtLoc[1], (float)gRTOutW, (float)gRTOutH);
 		if(s->rtLoc[2] >= 0) glUniform2f(s->rtLoc[2], (gRTOutTex && rtWantsRefl() && gRoadWet > 0.05f) ? 1.0f : 0.0f, gRTStrength);
 		if(s->rtLoc[3] >= 0) glUniform1i(s->rtLoc[3], 5);
-		if(s->rtLoc[4] >= 0) glUniform2f(s->rtLoc[4], (gShadowOutTex && gShadowStrengthNow > 0.001f) ? 1.0f : 0.0f, gShadowStrengthNow);
+		// x: 1 = sun shadows available, + 2 = roof test available
+		if(s->rtLoc[4] >= 0) glUniform2f(s->rtLoc[4], (gShadowOutTex && gShadowStrengthNow > 0.001f ? 1.0f : 0.0f) + (gShadowOutTex && gCoverNow ? 2.0f : 0.0f), gShadowStrengthNow);
 		s->velFrame = gFrameIdx;
 		s->velScene = gSceneSerial;
 	}
@@ -2365,17 +2367,17 @@ static const char *rsRTBlurSrc =
 "	ivec2 p = ivec2(gl_FragCoord.xy);\n"
 "	ivec2 hi = textureSize(depthRect) - 1;\n"
 "	float lc = lin(texelFetch(depthRect, p).r);\n"
-"	vec2 sum = vec2(0.0);\n"
+"	vec3 sum = vec3(0.0);\n"
 "	float ws = 0.0;\n"
 "	for(int y = -2; y <= 2; y++)\n"
 "	for(int x = -2; x <= 2; x++){\n"
 "		ivec2 q = clamp(p + ivec2(x, y), ivec2(0), hi);\n"
 "		float lq = lin(texelFetch(depthRect, q).r);\n"
 "		float w = exp(-float(x*x + y*y)*0.45)*exp(-abs(lq - lc)/(0.03*lc + 0.05));\n"
-"		sum += texelFetch(shadowTex, q).rg*w;\n"
+"		sum += texelFetch(shadowTex, q).rgb*w;\n"
 "		ws += w;\n"
 "	}\n"
-"	oShadow = vec4(sum/max(ws, 1e-4), 0.0, 1.0);\n"
+"	oShadow = vec4(sum/max(ws, 1e-4), 1.0);\n"
 "	vec4 r = texelFetch(reflRect, p)*0.25;\n"
 "	r += (texelFetch(reflRect, clamp(p + ivec2(1, 0), ivec2(0), hi)) + texelFetch(reflRect, clamp(p - ivec2(1, 0), ivec2(0), hi))\n"
 "	    + texelFetch(reflRect, clamp(p + ivec2(0, 1), ivec2(0), hi)) + texelFetch(reflRect, clamp(p - ivec2(0, 1), ivec2(0), hi)))*0.125;\n"
@@ -2491,7 +2493,8 @@ rsRayTracePass(void)
 	gRTEnv.maxDistance = gRTDistance;
 	gRTEnv.fogDistance = gRTDistance*0.8f;
 	gRTEnv.shadowDistance = gRTShadowDistance;
-	gRTEnv.shadows = gRTShadows ? 1 : 0;
+	gCoverNow = rtWetRoads() && regtaGfxPuddles;
+	gRTEnv.shadows = (gRTShadows ? 1 : 0) | (gCoverNow ? 2 : 0);	// bit 0 sun shadows, bit 1 roof test for puddles
 	gShadowStrengthNow = (gRTShadows && gRTEnv.sunVisibility > 0.01f) ? gRTShadowStrength*gRTEnv.sunVisibility : 0.0f;
 	bool ok = mrtTrace(gInvVPJit, &gRTEnv) != 0;
 	if(ok){

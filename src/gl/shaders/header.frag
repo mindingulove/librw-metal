@@ -102,12 +102,19 @@ void DoWet(inout vec4 color)
 	// Level ground takes the traced sun shadow here, in its own shader, from last frame's image (exact for static ground).
 	// Shadow and puddle then combine inside one shader instead of two screen passes fighting over the same pixels: the
 	// shadow darkens the ground, the puddle mirror is mixed over it afterwards and is not darkened.
-	if(groundMark > 0.5 && u_shadowParams.x > 0.5 && v_posPrev.w > 0.0){
+	bool shadowOn = mod(u_shadowParams.x, 2.0) > 0.5, coverOn = u_shadowParams.x > 1.5;
+	if(groundMark > 0.5 && shadowOn && v_posPrev.w > 0.0){
 		vec2 spu = (v_posPrev.xy/v_posPrev.w)*0.5 + 0.5;
 		if(spu.x > 0.0 && spu.x < 1.0 && spu.y > 0.0 && spu.y < 1.0){
 			float sh = texture(u_shadowPrev, spu).r;
 			color.rgb *= 1.0 - clamp(sh*u_shadowParams.y, 0.0, 1.0);
 		}
+	}
+	if(wetAmount > 0.001 && coverOn && v_posPrev.w > 0.0){
+		// ground under a roof (traced last frame, the map does not move) stays dry
+		vec2 cpu = (v_posPrev.xy/v_posPrev.w)*0.5 + 0.5;
+		if(cpu.x > 0.0 && cpu.x < 1.0 && cpu.y > 0.0 && cpu.y < 1.0)
+			wetAmount *= 1.0 - smoothstep(0.3, 0.8, texture(u_shadowPrev, cpu).b);
 	}
 	if(wetAmount > 0.001){
 		float n = puddleNoise(v_rpos.xy*0.22)*0.65 + puddleNoise(v_rpos.xy*0.9)*0.35;
