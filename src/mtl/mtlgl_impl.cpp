@@ -1289,6 +1289,7 @@ MGL void mgl_glGetFloatv(GLenum pname, GLfloat *v)
 MGL void mgl_glGetBooleanv(GLenum pname, GLboolean *v)
 {
 	if(pname == GL_COLOR_WRITEMASK) for(int i = 0; i < 4; i++) v[i] = G->colorMask[i];
+	else if(pname == GL_DEPTH_WRITEMASK) *v = G->depthMask;
 	else *v = 0;
 }
 

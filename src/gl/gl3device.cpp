@@ -2735,6 +2735,15 @@ resolveRenderScale(void)
 	glUniform1i(glGetUniformLocation(rsRcasProg, "tex"), 0);
 	glUniform1f(glGetUniformLocation(rsRcasProg, "sharp"), gRenderSharpness);
 	glDrawArrays(GL_TRIANGLES, 0, 3);
+	{
+		// The HUD is drawn into the window's framebuffer, whose depth nothing else clears: the radar masks its circle with
+		// depth, so anything that wrote depth there once (menu text) stayed cut out of the radar for good.
+		GLboolean dm = GL_TRUE;
+		glGetBooleanv(GL_DEPTH_WRITEMASK, &dm);
+		glDepthMask(GL_TRUE);
+		glClear(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+		glDepthMask(dm);
+	}
 
 	glBindVertexArray(prevVao);
 	glBindTexture(GL_TEXTURE_2D, prevTex0);
