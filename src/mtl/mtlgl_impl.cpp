@@ -181,6 +181,7 @@ struct Ctx {
 	CAMetalLayer *layer = nil;
 	NSWindow *window = nil;
 	int vsync = 1;
+	double pxPerPoint = 1.0;	// framebuffer pixels per window point the game asked for (1 without Retina)
 
 	id<MTLCommandBuffer> cb = nil;
 	id<MTLRenderCommandEncoder> enc = nil;
@@ -2057,7 +2058,11 @@ mtlglInit(void *nsWindow, int w, int h)
 		G->layer.device = G->dev;
 		G->layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
 		G->layer.framebufferOnly = YES;
-		G->layer.contentsScale = win.backingScaleFactor;
+		{
+			NSRect vb = view.bounds;
+			G->pxPerPoint = vb.size.width > 0 ? w/vb.size.width : 1.0;
+		}
+		G->layer.contentsScale = G->pxPerPoint;
 		G->layer.drawableSize = CGSizeMake(w, h);
 		G->layer.maximumDrawableCount = 3;
 		view.wantsLayer = YES;
@@ -2197,8 +2202,8 @@ mtlglPresent(void)
 		}
 		// follow the window: a changed backing size means a new default framebuffer
 		NSView *v = G->window.contentView;
-		NSRect b = [v convertRectToBacking:v.bounds];
-		int nw = (int)b.size.width, nh = (int)b.size.height;
+		NSRect b = v.bounds;
+		int nw = (int)(b.size.width*G->pxPerPoint + 0.5), nh = (int)(b.size.height*G->pxPerPoint + 0.5);
 		if(nw > 0 && nh > 0 && (nw != G->fbW || nh != G->fbH)) mtlglResize(nw, nh);
 	}
 }
