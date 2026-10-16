@@ -19,6 +19,7 @@
 #include <vector>
 #include <unordered_map>
 #include <map>
+#include <algorithm>
 #include <sys/stat.h>
 
 #include "../gl/glad/glad.h"
@@ -48,6 +49,13 @@ static bool dbgOn(void){ static int on = getenv("REGTA_MTLGL_LOG") ? 1 : 0; retu
 struct Stats { int passes, blits, draws, cbs, psos, uploads; } gStats = {}, gStatsSum = {};
 static int gStatFrames = 0, gFrameNo = 0;
 static bool traceFrame(void){ return dbgOn() && gFrameNo == 600; }
+// GPU time per render pass on timed frames (REGTA_MTLGL_LOG, every 240th frame): timestamps at the stage boundaries
+struct PassTime { std::string label; int draws; int first; };
+static std::vector<PassTime> gPassTimes;
+static id<MTLCounterSampleBuffer> gTsBuf = nil;
+static int gTsNext = 0;
+static bool gTimeThisFrame = false;
+static int gCurPassTime = -1;
 
 // ---------------------------------------------------------------------------------------------------------
 // objects
@@ -270,7 +278,7 @@ cmd(void)
 			// GPU busy time: command buffers can overlap, so only count time not already covered
 			double st = b.GPUStartTime, en = b.GPUEndTime;
 			if(en > st && en - st < 1.0){
-				static std::mutex m;
+				static std::mutex &m = *new std::mutex;	// never destroyed: completion handlers may still run during exit
 				static double lastEnd = 0.0;
 				std::lock_guard<std::mutex> lk(m);
 				double from = st > lastEnd ? st : lastEnd;
@@ -663,6 +671,20 @@ beginPass(Fbo *f)
 		}
 	}
 	f->clrDepth = f->clrStencil = false;
+	gCurPassTime = -1;
+	if(gTimeThisFrame && gTsBuf && gTsNext + 4 <= 4096){
+		pd.sampleBufferAttachments[0].sampleBuffer = gTsBuf;
+		pd.sampleBufferAttachments[0].startOfVertexSampleIndex = gTsNext;
+		pd.sampleBufferAttachments[0].endOfVertexSampleIndex = gTsNext + 1;
+		pd.sampleBufferAttachments[0].startOfFragmentSampleIndex = gTsNext + 2;
+		pd.sampleBufferAttachments[0].endOfFragmentSampleIndex = gTsNext + 3;
+		char b[200]; int n = 0;
+		for(int i = 0; i < 4; i++) if(color[i]) n += snprintf(b + n, sizeof(b) - n, "%sc%d %dx%d/%d", n ? " " : "", i, (int)color[i].width, (int)color[i].height, (int)color[i].pixelFormat);
+		if(depth) n += snprintf(b + n, sizeof(b) - n, " +depth");
+		gPassTimes.push_back({ b, 0, gTsNext });
+		gCurPassTime = (int)gPassTimes.size() - 1;
+		gTsNext += 4;
+	}
 	G->enc = [cmd() renderCommandEncoderWithDescriptor:pd];
 	gStats.passes++;
 	if(traceFrame()){
@@ -1171,6 +1193,7 @@ drawCommon(GLenum mode, GLsizei count, GLenum idxType, size_t idxOff, bool index
 	}
 	es.draws = true;
 	gStats.draws++;
+	if(gCurPassTime >= 0) gPassTimes[gCurPassTime].draws++;
 	if(mode == GL_TRIANGLE_FAN && count >= 3){
 		// no fans in Metal: expand to a triangle list
 		int tris = count - 2;
@@ -2113,8 +2136,47 @@ mtlglPresent(void)
 			[enc endEncoding];
 			[cmd() presentDrawable:dr];
 		}
-		submit(false);
+		if(gTimeThisFrame){
+			submit(true);
+			gTimeThisFrame = false;
+			NSData *d = [gTsBuf resolveCounterRange:NSMakeRange(0, gTsNext)];
+			const MTLCounterResultTimestamp *ts = d ? (const MTLCounterResultTimestamp*)d.bytes : nullptr;
+			if(ts){
+				// GPU timestamp ticks -> ns, from two CPU/GPU timestamp pairs
+				static MTLTimestamp c0 = 0, g0 = 0;
+				MTLTimestamp c1, g1;
+				[G->dev sampleTimestamps:&c1 gpuTimestamp:&g1];
+				double nsPerTick = (g0 && g1 > g0) ? (double)(c1 - c0)/(double)(g1 - g0) : 1.0;
+				c0 = c1; g0 = g1;
+				std::vector<std::pair<double, int>> order;
+				double total = 0;
+				for(size_t i = 0; i < gPassTimes.size(); i++){
+					const MTLCounterResultTimestamp *t = ts + gPassTimes[i].first;
+					uint64_t a = t[0].timestamp, e = t[3].timestamp;
+					if(a == MTLCounterErrorValue || e == MTLCounterErrorValue || e < a){ order.push_back({ -1.0, (int)i }); continue; }
+					double ms = (e - a)*nsPerTick/1e6;
+					total += ms;
+					order.push_back({ ms, (int)i });
+				}
+				std::sort(order.begin(), order.end(), [](const std::pair<double,int> &x, const std::pair<double,int> &y){ return x.first > y.first; });
+				logf_("GPU passes (%zu, sum %.1f ms, ns/tick %.3f):", gPassTimes.size(), total, nsPerTick);
+				for(size_t k = 0; k < order.size() && k < 14; k++)
+					logf_("  %6.2f ms  #%d  %s  draws %d", order[k].first, order[k].second, gPassTimes[order[k].second].label.c_str(), gPassTimes[order[k].second].draws);
+			}
+		}else
+			submit(false);
 		if(dbgOn()){
+			if(!gTsBuf){
+				for(id<MTLCounterSet> cs in G->dev.counterSets) if([cs.name isEqualToString:MTLCommonCounterSetTimestamp]){
+					MTLCounterSampleBufferDescriptor *sd = [MTLCounterSampleBufferDescriptor new];
+					sd.counterSet = cs; sd.storageMode = MTLStorageModeShared; sd.sampleCount = 4096;
+					NSError *e = nil;
+					gTsBuf = [G->dev newCounterSampleBufferWithDescriptor:sd error:&e];
+					if(!gTsBuf) logf_("no timestamp sample buffer: %s", e.localizedDescription.UTF8String);
+				}
+				if(![G->dev supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]){ logf_("GPU has no stage boundary timestamps"); gTsBuf = nil; }
+			}
+			if(gTsBuf && (gFrameNo % 240) == 239){ gTimeThisFrame = true; gTsNext = 0; gPassTimes.clear(); }
 			if(traceFrame()) logf_("---- end of traced frame %d", gFrameNo);
 			gFrameNo++;
 			if(gFrameNo == 600) logf_("---- trace of frame 600");
