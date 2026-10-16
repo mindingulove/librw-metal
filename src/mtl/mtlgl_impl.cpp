@@ -996,8 +996,7 @@ drawCommon(GLenum mode, GLsizei count, GLenum idxType, size_t idxOff, bool index
 		auto &sm = p->tr.samplers[i];
 		int unit = p->samplerUnit[i];
 		if(unit < 0 || unit > 15) unit = 0;
-		Tex *t = texOf(G->unitTex2D[unit]);
-		if(!t) t = texOf(G->unitTexRect[unit]);
+		Tex *t = sm.rect ? texOf(G->unitTexRect[unit]) : texOf(G->unitTex2D[unit]);
 		id<MTLTexture> mt = nil; id<MTLSamplerState> ss = nil;
 		if(t && ensureTex(t)){ mt = t->mtl; t->lastUse = G->serial; ss = samplerFor(t); }
 		if(!mt){
@@ -1986,3 +1985,14 @@ extern "C" void *mtlglTexture(unsigned int name)
 	return (__bridge void*)t->mtl;
 }
 extern "C" void mtlglFlush(void){ if(G) submit(false); }
+
+// A GL texture name for a Metal texture made elsewhere (shared with the ray tracing and MetalFX code).
+extern "C" unsigned int mtlglWrapTexture(void *mtlTexture)
+{
+	if(!G || !mtlTexture) return 0;
+	id<MTLTexture> mt = (__bridge id<MTLTexture>)mtlTexture;
+	Tex *t = new Tex();
+	t->mtl = mt; t->w = (int)mt.width; t->h = (int)mt.height; t->fmt = mt.pixelFormat; t->created = 1;
+	t->minF = t->magF = GL_NEAREST; t->wrapS = t->wrapT = GL_CLAMP_TO_EDGE;
+	return addObj(G->texs, t);
+}

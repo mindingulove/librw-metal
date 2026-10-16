@@ -9,6 +9,8 @@
 #include <spirv_cross/spirv_msl.hpp>
 
 #include <map>
+#include <string.h>
+#include <ctype.h>
 #include <regex>
 #include <sstream>
 #include <mutex>
@@ -48,12 +50,15 @@ preprocess(EShLanguage stage, const std::string &src, std::string &out, std::str
 	return true;
 }
 
+static void fixRectCalls(std::string &src);
+
 struct StageText {
 	std::string head;		// #version / #extension lines
 	std::string body;		// the rest, transformed
 	std::vector<std::pair<std::string, std::string>> uniforms;	// type, "name" or "name[N]"
 	std::vector<std::string> samplers;	// names
 	std::vector<std::string> samplerTypes;
+	std::vector<std::string> rectNames;
 };
 
 // Moves loose uniforms out of the text, gives varyings locations. varyLoc maps varying names to locations.
@@ -62,7 +67,23 @@ transformStage(const std::string &pre, bool isVertex, std::map<std::string, int>
 {
 	static const std::regex uniformRe(R"(^\s*uniform\s+(?:highp\s+|mediump\s+|lowp\s+)?(\w+)\s+(\w+)\s*(\[\s*\d+\s*\])?\s*;\s*$)");
 	static const std::regex varyRe(R"(^\s*(?:layout\s*\(\s*location\s*=\s*(\d+)\s*\)\s*)?(flat\s+|smooth\s+|noperspective\s+)?(in|out)\s+(?:highp\s+|mediump\s+|lowp\s+)?(\w+)\s+(\w+)\s*(\[\s*\d+\s*\])?\s*;\s*$)");
-	std::istringstream in(pre);
+	std::string fixedPre = pre;
+	{
+		size_t p = 0;
+		while((p = fixedPre.find("gl_VertexID", p)) != std::string::npos){ fixedPre.replace(p, 11, "gl_VertexIndex"); p += 14; }
+	}
+	{
+		// remember which samplers are rectangle textures, then treat them as 2D
+		std::regex rectRe(R"(uniform\s+sampler2DRect\s+(\w+)\s*;)");
+		for(auto it = std::sregex_iterator(pre.begin(), pre.end(), rectRe); it != std::sregex_iterator(); ++it)
+			st.rectNames.push_back((*it)[1]);
+		if(!st.rectNames.empty()){
+			size_t p = 0;
+			while((p = fixedPre.find("sampler2DRect", p)) != std::string::npos){ fixedPre.replace(p, 13, "sampler2D"); }
+			fixRectCalls(fixedPre);
+		}
+	}
+	std::istringstream in(fixedPre);
 	std::string line;
 	std::string body;
 	bool headDone = false;
@@ -119,8 +140,36 @@ transformStage(const std::string &pre, bool isVertex, std::map<std::string, int>
 	st.body = body;
 }
 
-static int
-mslSlotSort(const void*, const void*) { return 0; }
+// Rectangle textures are plain 2D textures in Metal. The engine only reads them with texelFetch(sampler, ivec2) and
+// textureSize(sampler): give those calls the level argument that sampler2D wants.
+static void
+fixRectCalls(std::string &src)
+{
+	for(const char *fn : { "texelFetch", "textureSize" }){
+		size_t want = strcmp(fn, "texelFetch") == 0 ? 1 : 0;	// texelFetch: add the level when there are 2 arguments; textureSize: when 1
+		size_t pos = 0;
+		size_t flen = strlen(fn);
+		while((pos = src.find(fn, pos)) != std::string::npos){
+			size_t open = pos + flen;
+			bool word = (pos > 0 && (isalnum((unsigned char)src[pos - 1]) || src[pos - 1] == '_')) || open >= src.size() || src[open] != '(';
+			if(word){ pos = open; continue; }
+			int depth = 0; size_t i = open; int commas = 0;
+			for(; i < src.size(); i++){
+				char c = src[i];
+				if(c == '(') depth++;
+				else if(c == ')'){ if(--depth == 0) break; }
+				else if(c == ',' && depth == 1) commas++;
+			}
+			if(i >= src.size()) break;
+			int args = commas + 1;
+			if((want == 1 && args == 2) || (want == 0 && args == 1)){
+				src.insert(i, ", 0");
+				i += 3;
+			}
+			pos = i;
+		}
+	}
+}
 
 static bool
 buildStage(EShLanguage stage, StageText &st, std::vector<unsigned> &spirv, std::string &err)
@@ -155,7 +204,6 @@ buildStage(EShLanguage stage, StageText &st, std::vector<unsigned> &spirv, std::
 		return false;
 	}
 	glslang::GlslangToSpv(*prog.getIntermediate(stage), spirv);
-	(void)mslSlotSort;
 	return true;
 }
 
@@ -224,7 +272,11 @@ toMsl(std::vector<unsigned> &spirv, bool isVertex, StageText &st, int stageIdx, 
 		}
 	}
 	for(size_t i = 0; i < st.samplers.size(); i++)
-		prog.samplers.push_back({ st.samplers[i], stageIdx, (int)i });
+		{
+			bool rect = false;
+			for(auto &r : st.rectNames) if(r == st.samplers[i]) rect = true;
+			prog.samplers.push_back({ st.samplers[i], stageIdx, (int)i, rect });
+		}
 	return true;
 }
 

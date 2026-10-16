@@ -3622,9 +3622,6 @@ startGLFW(void)
 			}
 			fclose(ini);
 		}
-#ifdef RW_METALGL
-		gRT = false; gMetalFX = false;	// the ray tracing and MetalFX passes still use OpenGL texture sharing
-#endif
 		// everything the menu can switch on later needs the offscreen target and its attachments from the start
 		gUseTarget = true;
 		gNeedVel = true;

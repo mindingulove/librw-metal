@@ -17,6 +17,7 @@ struct TransSampler {
 	std::string name;
 	int stage;
 	int slot;	// texture and sampler index in the MSL
+	bool rect;	// was a sampler2DRect (GL_TEXTURE_RECTANGLE binding)
 };
 
 // Result of translating one GLSL vertex/fragment pair to Metal Shading Language.
