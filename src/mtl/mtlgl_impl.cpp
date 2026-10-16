@@ -44,6 +44,10 @@ static void logf_(const char *fmt, ...)
 }
 
 static bool dbgOn(void){ static int on = getenv("REGTA_MTLGL_LOG") ? 1 : 0; return on != 0; }
+// per frame statistics (REGTA_MTLGL_LOG): render passes, blits, draws, command buffers, new pipeline states
+struct Stats { int passes, blits, draws, cbs, psos, uploads; } gStats = {}, gStatsSum = {};
+static int gStatFrames = 0, gFrameNo = 0;
+static bool traceFrame(void){ return dbgOn() && gFrameNo == 600; }
 
 // ---------------------------------------------------------------------------------------------------------
 // objects
@@ -279,10 +283,20 @@ cmd(void)
 	return G->cb;
 }
 
+static void endEncoder(void);
+static id<MTLBlitCommandEncoder>
+newBlit(void)
+{
+	gStats.blits++;
+	if(traceFrame()) logf_("  blit");
+	return [cmd() blitCommandEncoder];
+}
+
 static void
 endEncoder(void)
 {
 	if(G->enc){
+		if(traceFrame()) logf_("  end pass");
 		[G->enc endEncoding];
 		G->enc = nil;
 	}
@@ -297,6 +311,7 @@ submit(bool wait)
 		id<MTLCommandBuffer> cb = G->cb;
 		G->cb = nil;
 		[cb commit];
+		gStats.cbs++;
 		G->serial++;
 		if(wait) [cb waitUntilCompleted];
 	}
@@ -472,7 +487,7 @@ uploadLevel(Tex *t, int level, const void *bytes, size_t rowBytes, int w, int h)
 		if(ringAlloc(total, &sb, &so)){
 			memcpy((uint8_t*)sb.contents + so, bytes, total);
 			endEncoder();
-			id<MTLBlitCommandEncoder> bl = [cmd() blitCommandEncoder];
+			id<MTLBlitCommandEncoder> bl = newBlit();
 			[bl copyFromBuffer:sb sourceOffset:so sourceBytesPerRow:rowBytes sourceBytesPerImage:total
 			        sourceSize:MTLSizeMake(w, h, 1) toTexture:t->mtl destinationSlice:0 destinationLevel:level
 			        destinationOrigin:MTLOriginMake(0, 0, 0)];
@@ -509,6 +524,7 @@ ensureTex(Tex *t)
 	if(!t->mtl){ logf_("texture creation failed %dx%d fmt %d", t->w, t->h, (int)t->fmt); return false; }
 	t->created = n;
 	t->lastUse = 0;
+	gStats.uploads++;
 	if(dbgOn()){
 		int withData = 0;
 		for(auto &l : t->lv) if(!l.data.empty()) withData++;
@@ -529,7 +545,7 @@ ensureTex(Tex *t)
 		}
 		if(t->genMips && any && !t->compressed){
 			endEncoder();
-			id<MTLBlitCommandEncoder> bl = [cmd() blitCommandEncoder];
+			id<MTLBlitCommandEncoder> bl = newBlit();
 			[bl generateMipmapsForTexture:t->mtl];
 			[bl endEncoding];
 			t->lastUse = G->serial;
@@ -645,6 +661,13 @@ beginPass(Fbo *f)
 	}
 	f->clrDepth = f->clrStencil = false;
 	G->enc = [cmd() renderCommandEncoderWithDescriptor:pd];
+	gStats.passes++;
+	if(traceFrame()){
+		char b[256]; int n = 0;
+		for(int i = 0; i < 4; i++) if(color[i]) n += snprintf(b + n, sizeof(b) - n, " c%d %dx%d fmt%d %s", i, (int)color[i].width, (int)color[i].height, (int)color[i].pixelFormat, pd.colorAttachments[i].loadAction == MTLLoadActionClear ? "clear" : "load");
+		if(depth) n += snprintf(b + n, sizeof(b) - n, " depth %s", pd.depthAttachment.loadAction == MTLLoadActionClear ? "clear" : "load");
+		logf_("  pass fbo %p%s", (void*)f, b);
+	}
 	G->es = Ctx::EncState();
 	G->es.fbo = f;
 	for(int i = 0; i < 4; i++) G->es.color[i] = color[i];
@@ -1001,6 +1024,7 @@ drawCommon(GLenum mode, GLsizei count, GLenum idxType, size_t idxOff, bool index
 		if(key.depthFmt) d.depthAttachmentPixelFormat = (MTLPixelFormat)key.depthFmt;
 		if(key.stencilFmt) d.stencilAttachmentPixelFormat = (MTLPixelFormat)key.stencilFmt;
 		pso = [G->dev newRenderPipelineStateWithDescriptor:d error:&e];
+		gStats.psos++;
 		if(!pso) logf_("pipeline state: %s", e.localizedDescription.UTF8String);
 		G->psos[key] = pso;
 	}
@@ -1138,6 +1162,7 @@ drawCommon(GLenum mode, GLsizei count, GLenum idxType, size_t idxOff, bool index
 	default: return;
 	}
 	es.draws = true;
+	gStats.draws++;
 	if(mode == GL_TRIANGLE_FAN && count >= 3){
 		// no fans in Metal: expand to a triangle list
 		int tris = count - 2;
@@ -1439,7 +1464,7 @@ MGL void mgl_glTexSubImage2D(GLenum target, GLint level, GLint x, GLint y, GLsiz
 		if(ringAlloc(px.size(), &sb, &so)){
 			memcpy((uint8_t*)sb.contents + so, px.data(), px.size());
 			endEncoder();
-			id<MTLBlitCommandEncoder> bl = [cmd() blitCommandEncoder];
+			id<MTLBlitCommandEncoder> bl = newBlit();
 			[bl copyFromBuffer:sb sourceOffset:so sourceBytesPerRow:rb sourceBytesPerImage:px.size() sourceSize:MTLSizeMake(w, h, 1)
 			         toTexture:t->mtl destinationSlice:0 destinationLevel:level destinationOrigin:MTLOriginMake(x, y, 0)];
 			[bl endEncoding];
@@ -1456,7 +1481,7 @@ MGL void mgl_glGenerateMipmap(GLenum target)
 	if(!t->mtl){ t->genMips = true; return; }
 	if(t->created > 1 && !t->compressed){
 		endEncoder();
-		id<MTLBlitCommandEncoder> bl = [cmd() blitCommandEncoder];
+		id<MTLBlitCommandEncoder> bl = newBlit();
 		[bl generateMipmapsForTexture:t->mtl];
 		[bl endEncoding];
 		t->lastUse = G->serial;
@@ -1653,7 +1678,7 @@ MGL void mgl_glCopyTexSubImage2D(GLenum target, GLint level, GLint xo, GLint yo,
 	id<MTLTexture> src = readTarget(fboOf(G->readFbo));
 	if(!src) return;
 	endEncoder();
-	id<MTLBlitCommandEncoder> bl = [cmd() blitCommandEncoder];
+	id<MTLBlitCommandEncoder> bl = newBlit();
 	[bl copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(x, y, 0) sourceSize:MTLSizeMake(w, h, 1)
 	          toTexture:t->mtl destinationSlice:0 destinationLevel:level destinationOrigin:MTLOriginMake(xo, yo, 0)];
 	[bl endEncoding];
@@ -1674,7 +1699,7 @@ MGL void mgl_glBlitFramebuffer(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint
 		if(st && dt){
 			if(same && st.pixelFormat == dt.pixelFormat){
 				endEncoder();
-				id<MTLBlitCommandEncoder> bl = [cmd() blitCommandEncoder];
+				id<MTLBlitCommandEncoder> bl = newBlit();
 				[bl copyFromTexture:st sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(sx0, sy0, 0) sourceSize:MTLSizeMake(sw, sh, 1)
 				          toTexture:dt destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(dx0, dy0, 0)];
 				[bl endEncoding];
@@ -1717,7 +1742,7 @@ MGL void mgl_glBlitFramebuffer(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint
 		id<MTLTexture> st = attachTexture(src->depth), dt = attachTexture(dst->depth);
 		if(st && dt && same && st.pixelFormat == dt.pixelFormat){
 			endEncoder();
-			id<MTLBlitCommandEncoder> bl = [cmd() blitCommandEncoder];
+			id<MTLBlitCommandEncoder> bl = newBlit();
 			[bl copyFromTexture:st sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(sx0, sy0, 0) sourceSize:MTLSizeMake(sw, sh, 1)
 			          toTexture:dt destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(dx0, dy0, 0)];
 			[bl endEncoding];
@@ -2081,6 +2106,19 @@ mtlglPresent(void)
 			[cmd() presentDrawable:dr];
 		}
 		submit(false);
+		if(dbgOn()){
+			if(traceFrame()) logf_("---- end of traced frame %d", gFrameNo);
+			gFrameNo++;
+			if(gFrameNo == 600) logf_("---- trace of frame 600");
+			gStatsSum.passes += gStats.passes; gStatsSum.blits += gStats.blits; gStatsSum.draws += gStats.draws;
+			gStatsSum.cbs += gStats.cbs; gStatsSum.psos += gStats.psos; gStatsSum.uploads += gStats.uploads;
+			gStats = Stats();
+			if(++gStatFrames == 120){
+				logf_("per frame: %.1f passes, %.1f blits, %.0f draws, %.1f command buffers, %.2f new pipelines, %.1f texture creations, GPU %.1f ms",
+				      gStatsSum.passes/120.0, gStatsSum.blits/120.0, gStatsSum.draws/120.0, gStatsSum.cbs/120.0, gStatsSum.psos/120.0, gStatsSum.uploads/120.0, G->gpuMs);
+				gStatsSum = Stats(); gStatFrames = 0;
+			}
+		}
 		{
 			uint64_t now = G->gpuNs.load();
 			float ms = (float)((now - G->gpuNsAtPresent)/1.0e6);
