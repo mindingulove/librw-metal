@@ -148,6 +148,23 @@ set_target_properties(librw
         PREFIX ""
 )
 
+option(LIBRW_METALGL "Run the OpenGL backend on Metal (macOS)" OFF)
+if(LIBRW_PLATFORM_GL3 AND LIBRW_METALGL)
+    find_library(MTLGL_GLSLANG glslang PATHS /opt/homebrew/lib REQUIRED)
+    find_library(MTLGL_GLSLANG_RES glslang-default-resource-limits PATHS /opt/homebrew/lib REQUIRED)
+    find_library(MTLGL_SPIRV SPIRV PATHS /opt/homebrew/lib REQUIRED)
+    find_library(MTLGL_SCROSS_MSL spirv-cross-msl PATHS /opt/homebrew/lib REQUIRED)
+    find_library(MTLGL_SCROSS_GLSL spirv-cross-glsl PATHS /opt/homebrew/lib REQUIRED)
+    find_library(MTLGL_SCROSS_CORE spirv-cross-core PATHS /opt/homebrew/lib REQUIRED)
+    target_sources(librw PRIVATE mtl/mtlgl_impl.cpp mtl/mtlshadertrans.cpp mtl/mtlgl.h mtl/mtlshadertrans.h)
+    set_source_files_properties(mtl/mtlgl_impl.cpp PROPERTIES COMPILE_OPTIONS "-x;objective-c++;-fobjc-arc;-std=c++17;-Wno-deprecated-declarations")
+    set_source_files_properties(mtl/mtlshadertrans.cpp PROPERTIES COMPILE_OPTIONS "-std=c++17")
+    target_include_directories(librw PRIVATE /opt/homebrew/include /opt/homebrew/include/glslang)
+    target_compile_definitions(librw PUBLIC RW_METALGL)
+    target_link_libraries(librw PUBLIC ${MTLGL_GLSLANG} ${MTLGL_GLSLANG_RES} ${MTLGL_SPIRV} ${MTLGL_SCROSS_MSL} ${MTLGL_SCROSS_GLSL}
+        ${MTLGL_SCROSS_CORE} "-framework Metal" "-framework QuartzCore" "-framework Cocoa" "-framework Foundation")
+endif()
+
 if(LIBRW_PLATFORM_GL3)
     if (LIBRW_GL3_GFXLIB STREQUAL "GLFW")
         if (NOT TARGET glfw)

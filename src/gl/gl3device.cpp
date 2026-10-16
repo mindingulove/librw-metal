@@ -24,6 +24,12 @@
 
 #define PLUGIN_ID 0
 
+#ifdef RW_METALGL
+#define GLFW_EXPOSE_NATIVE_COCOA
+#include <GLFW/glfw3native.h>
+#include "../mtl/mtlgl.h"
+#endif
+
 namespace rw {
 namespace gl3 {
 
@@ -3066,11 +3072,19 @@ showRaster(Raster *raster, uint32 flags)
 	static int sinceSet = 0;
 	int wantInterval = (flags & Raster::FLIPWAITVSYNCH) ? 1 : 0;
 	if(wantInterval != curInterval || ++sinceSet >= 30){
+#ifdef RW_METALGL
+		mtlglSetVsync(wantInterval);
+#else
 		glfwSwapInterval(wantInterval);
+#endif
 		curInterval = wantInterval;
 		sinceSet = 0;
 	}
+#ifdef RW_METALGL
+	mtlglPresent();
+#else
 	glfwSwapBuffers(glGlobals.window);
+#endif
 	gScaledFrame = true;
 	gSceneFrameStart = perfNow();
 	if(sceneQueriesUsable()){
@@ -3608,6 +3622,9 @@ startGLFW(void)
 			}
 			fclose(ini);
 		}
+#ifdef RW_METALGL
+		gRT = false; gMetalFX = false;	// the ray tracing and MetalFX passes still use OpenGL texture sharing
+#endif
 		// everything the menu can switch on later needs the offscreen target and its attachments from the start
 		gUseTarget = true;
 		gNeedVel = true;
@@ -3649,6 +3666,19 @@ startGLFW(void)
 		glfwWindowHint(GLFW_SAMPLES, glGlobals.numSamples);
 
 	int i;
+#ifdef RW_METALGL
+	glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+	if(mode->flags & VIDEOMODEEXCLUSIVE)
+		win = glfwCreateWindow(mode->mode.width, mode->mode.height, glGlobals.winTitle, glGlobals.monitor, nil);
+	else
+		win = glfwCreateWindow(glGlobals.winWidth, glGlobals.winHeight, glGlobals.winTitle, nil, nil);
+	if(win){
+		gl3Caps.gles = false;
+		gl3Caps.glversion = 33;
+	}
+	i = 0;
+	if(0)
+#endif
 	for(i = 0; profiles[i].gl; i++){
 		glfwWindowHint(GLFW_CLIENT_API, profiles[i].gl);
 		glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, profiles[i].major);
@@ -3676,6 +3706,22 @@ startGLFW(void)
 		RWERROR((ERR_GENERAL, "glfwCreateWindow() failed"));
 		return 0;
 	}
+#ifdef RW_METALGL
+	{
+		int fbw, fbh;
+		glfwGetFramebufferSize(win, &fbw, &fbh);
+		if(!mtlglInit((void*)glfwGetCocoaWindow(win), fbw, fbh)){
+			RWERROR((ERR_GENERAL, "mtlglInit failed"));
+			glfwDestroyWindow(win);
+			return 0;
+		}
+	}
+	if (!gladLoadGLLoader((GLADloadproc) mtlglGetProcAddress, gl3Caps.glversion)) {
+		RWERROR((ERR_GENERAL, "gladLoadGLLoader failed"));
+		glfwDestroyWindow(win);
+		return 0;
+	}
+#else
 	glfwMakeContextCurrent(win);
 
 	/* Init GLAD */
@@ -3684,10 +3730,13 @@ startGLFW(void)
 		glfwDestroyWindow(win);
 		return 0;
 	}
+#endif
 
 	printf("OpenGL version: %s (%s)\n", glGetString(GL_VERSION), glGetString(GL_RENDERER));
 #ifdef __APPLE__
+#ifndef RW_METALGL
 	if(gGLMultithread) regtaEnableGLMultithreading();
+#endif
 #endif
 
 	glGlobals.window = win;
