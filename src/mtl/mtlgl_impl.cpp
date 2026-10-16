@@ -1819,12 +1819,39 @@ MGL void mgl_glGetTexImage(GLenum target, GLint level, GLenum format, GLenum typ
 	int w = t->w >> level, h = t->h >> level; if(w < 1) w = 1; if(h < 1) h = 1;
 	size_t rb; size_t total = levelBytes(t->fmt, w, h, &rb);
 	std::vector<uint8_t> raw(total);
-	[t->mtl getBytes:raw.data() bytesPerRow:rb fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:level];
+	MTLPixelFormat srcFmt = t->fmt;
+	if(srcFmt != MTLPixelFormatRGBA8Unorm && srcFmt != MTLPixelFormatBGRA8Unorm && type == GL_UNSIGNED_BYTE && !t->depth){
+		// compressed (or other) formats: let the GPU decode the level into RGBA8, like OpenGL does for glGetTexImage
+		id<MTLTexture> view = [t->mtl newTextureViewWithPixelFormat:t->fmt textureType:MTLTextureType2D levels:NSMakeRange(level, 1) slices:NSMakeRange(0, 1)];
+		MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:w height:h mipmapped:NO];
+		d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead; d.storageMode = MTLStorageModeShared;
+		id<MTLTexture> dst = [G->dev newTextureWithDescriptor:d];
+		MTLRenderPassDescriptor *pd = [MTLRenderPassDescriptor renderPassDescriptor];
+		pd.colorAttachments[0].texture = dst; pd.colorAttachments[0].loadAction = MTLLoadActionClear; pd.colorAttachments[0].storeAction = MTLStoreActionStore;
+		id<MTLCommandBuffer> cb = [G->queue commandBuffer];
+		id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:pd];
+		MTLPixelFormat cf[4] = { MTLPixelFormatRGBA8Unorm, MTLPixelFormatInvalid, MTLPixelFormatInvalid, MTLPixelFormatInvalid };
+		MTLColorWriteMask mk[4] = { MTLColorWriteMaskAll, MTLColorWriteMaskNone, MTLColorWriteMaskNone, MTLColorWriteMaskNone };
+		[enc setRenderPipelineState:utilPso(true, cf, MTLPixelFormatInvalid, mk)];
+		float params[8] = { 0, 0, 1, 1, 1, 0, 0, 0 };
+		[enc setVertexBytes:params length:sizeof(params) atIndex:0];
+		Tex dummy; dummy.minF = dummy.magF = GL_NEAREST; dummy.wrapS = dummy.wrapT = GL_CLAMP_TO_EDGE; dummy.created = 1;
+		[enc setFragmentSamplerState:samplerFor(&dummy) atIndex:0];
+		[enc setFragmentTexture:view atIndex:0];
+		[enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+		[enc endEncoding];
+		[cb commit]; [cb waitUntilCompleted];
+		rb = (size_t)w*4;
+		raw.assign(rb*h, 0);
+		[dst getBytes:raw.data() bytesPerRow:rb fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
+		srcFmt = MTLPixelFormatRGBA8Unorm;
+	}else
+		[t->mtl getBytes:raw.data() bytesPerRow:rb fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:level];
 	int comps = format == GL_RGBA || format == GL_BGRA ? 4 : format == GL_RGB ? 3 : 1;
 	uint8_t *o = (uint8_t*)out;
 	size_t dstRow = ((size_t)w*comps + G->packAlign - 1)/G->packAlign*G->packAlign;
-	if(t->fmt == MTLPixelFormatRGBA8Unorm || t->fmt == MTLPixelFormatBGRA8Unorm){
-		bool bgraSrc = t->fmt == MTLPixelFormatBGRA8Unorm;
+	if(srcFmt == MTLPixelFormatRGBA8Unorm || srcFmt == MTLPixelFormatBGRA8Unorm){
+		bool bgraSrc = srcFmt == MTLPixelFormatBGRA8Unorm;
 		for(int yy = 0; yy < h; yy++) for(int xx = 0; xx < w; xx++){
 			const uint8_t *p = &raw[yy*rb + (size_t)xx*4];
 			uint8_t r = bgraSrc ? p[2] : p[0], g = p[1], b = bgraSrc ? p[0] : p[2], a = p[3];
