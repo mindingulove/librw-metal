@@ -3622,6 +3622,10 @@ startGLFW(void)
 			}
 			fclose(ini);
 		}
+		// debugging switches: REGTA_NO_RT=1, REGTA_NO_MFX=1 (also turns off temporal when REGTA_NO_TEMPORAL=1)
+		if(getenv("REGTA_NO_RT")) gRT = false;
+		if(getenv("REGTA_NO_MFX")) gMetalFX = false;
+		if(getenv("REGTA_NO_TEMPORAL")) gTemporal = false;
 		// everything the menu can switch on later needs the offscreen target and its attachments from the start
 		gUseTarget = true;
 		gNeedVel = true;
