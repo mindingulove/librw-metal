@@ -18,6 +18,7 @@
 #include <vector>
 #include <unordered_map>
 #include <map>
+#include <sys/stat.h>
 
 #include "../gl/glad/glad.h"
 #include "mtlgl.h"
@@ -112,6 +113,8 @@ struct Prog {
 	std::unordered_map<std::string, int> byName;
 	// compiled lazily
 	bool compiled = false, compileFailed = false;
+	int kind = 0;	// debugging: 1 skinned, 2 vehicle
+	int dumped = 0;
 };
 
 struct Attrib {
@@ -807,6 +810,39 @@ depthStencilState(bool hasDepth, bool hasStencil)
 	return st;
 }
 
+// debugging: writes a texture's level 0, decoded to RGBA8, to mtl_dump/tex<name>.rgba (with a small text header)
+static void
+dumpTexture(Tex *t)
+{
+	if(!t || !t->mtl) return;
+	int w = t->w, h = t->h;
+	MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:w height:h mipmapped:NO];
+	d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead; d.storageMode = MTLStorageModeShared;
+	id<MTLTexture> dst = [G->dev newTextureWithDescriptor:d];
+	MTLRenderPassDescriptor *pd = [MTLRenderPassDescriptor renderPassDescriptor];
+	pd.colorAttachments[0].texture = dst; pd.colorAttachments[0].loadAction = MTLLoadActionClear; pd.colorAttachments[0].storeAction = MTLStoreActionStore;
+	id<MTLCommandBuffer> cb = [G->queue commandBuffer];
+	id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:pd];
+	MTLPixelFormat cf[4] = { MTLPixelFormatRGBA8Unorm, MTLPixelFormatInvalid, MTLPixelFormatInvalid, MTLPixelFormatInvalid };
+	MTLColorWriteMask mk[4] = { MTLColorWriteMaskAll, MTLColorWriteMaskNone, MTLColorWriteMaskNone, MTLColorWriteMaskNone };
+	id<MTLRenderPipelineState> pso = utilPso(true, cf, MTLPixelFormatInvalid, mk);
+	[enc setRenderPipelineState:pso];
+	float params[8] = { 0, 0, 1, 1, 1, 0, 0, 0 };
+	[enc setVertexBytes:params length:sizeof(params) atIndex:0];
+	Tex dummy; dummy.minF = dummy.magF = GL_NEAREST; dummy.created = 1;
+	[enc setFragmentSamplerState:samplerFor(&dummy) atIndex:0];
+	[enc setFragmentTexture:t->mtl atIndex:0];
+	[enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+	[enc endEncoding];
+	submit(true);
+	[cb commit]; [cb waitUntilCompleted];
+	std::vector<uint8_t> px((size_t)w*h*4);
+	[dst getBytes:px.data() bytesPerRow:(size_t)w*4 fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
+	mkdir("mtl_dump", 0755);
+	char name[128]; snprintf(name, sizeof(name), "mtl_dump/tex%u_%dx%d_fmt%x_lv%d.rgba", t->name, w, h, t->ifmt, t->created);
+	if(FILE *f = fopen(name, "wb")){ fwrite(px.data(), 1, px.size(), f); fclose(f); }
+}
+
 static void
 drawCommon(GLenum mode, GLsizei count, GLenum idxType, size_t idxOff, bool indexed, GLint first)
 {
@@ -822,6 +858,12 @@ drawCommon(GLenum mode, GLsizei count, GLenum idxType, size_t idxOff, bool index
 		if(unit < 0 || unit > 15) unit = 0;
 		Tex *t = p->tr.samplers[i].rect ? texOf(G->unitTexRect[unit]) : texOf(G->unitTex2D[unit]);
 		if(t && ensureTex(t)) sampled[i] = t;
+	}
+	if(dbgOn() && p->kind && p->dumped < 4){
+		p->dumped++;
+		for(size_t i = 0; i < p->tr.samplers.size() && i < 16; i++)
+			if(sampled[i] && !sampled[i]->warned){ sampled[i]->warned = true; dumpTexture(sampled[i]);
+				logf_("prog %u (kind %d) sampler %s unit %d -> tex %u", (unsigned)G->prog, p->kind, p->tr.samplers[i].name.c_str(), p->samplerUnit[i], sampled[i]->name); }
 	}
 	if(!beginPass(f)) return;
 	Vao *vao = G->vao < G->vaos.size() ? G->vaos[G->vao] : nullptr;
@@ -1781,6 +1823,9 @@ MGL void mgl_glLinkProgram(GLuint id)
 	}
 	p->samplerUnit.assign(p->tr.samplers.size(), 0);
 	p->linked = true;
+	if(p->vsSrcParts.back().find("u_boneMatrices") != std::string::npos) p->kind = 1;
+	else if(p->vsSrcParts.back().find("u_reflProps") != std::string::npos) p->kind = 2;
+	if(dbgOn()) logf_("prog %u linked kind %d samplers %zu", id, p->kind, p->tr.samplers.size());
 	p->vsSrcParts.clear(); p->fsSrcParts.clear();
 }
 MGL void mgl_glGetProgramiv(GLuint id, GLenum pname, GLint *v)
