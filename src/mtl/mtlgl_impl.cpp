@@ -14,6 +14,7 @@
 #include <string.h>
 #include <math.h>
 #include <atomic>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -261,8 +262,16 @@ cmd(void)
 		G->cb = [G->queue commandBuffer];
 		uint64_t s = G->serial;
 		[G->cb addCompletedHandler:^(id<MTLCommandBuffer> b){
-			double t = b.GPUEndTime - b.GPUStartTime;
-			if(t > 0.0 && t < 1.0) G->gpuNs.fetch_add((uint64_t)(t*1e9));
+			// GPU busy time: command buffers can overlap, so only count time not already covered
+			double st = b.GPUStartTime, en = b.GPUEndTime;
+			if(en > st && en - st < 1.0){
+				static std::mutex m;
+				static double lastEnd = 0.0;
+				std::lock_guard<std::mutex> lk(m);
+				double from = st > lastEnd ? st : lastEnd;
+				if(en > from) G->gpuNs.fetch_add((uint64_t)((en - from)*1e9));
+				if(en > lastEnd) lastEnd = en;
+			}
 			uint64_t cur = G->completed.load();
 			while(cur < s && !G->completed.compare_exchange_weak(cur, s)) {}
 		}];
