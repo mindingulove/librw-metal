@@ -2028,7 +2028,9 @@ rsMetalFXPass(void)
 	glUniformMatrix4fv(glGetUniformLocation(rsMfxPrepProg, "invVP"), 1, GL_FALSE, gInvVP);
 	glUniformMatrix4fv(glGetUniformLocation(rsMfxPrepProg, "prevVP"), 1, GL_FALSE, gPrevVP);
 	glDrawArrays(GL_TRIANGLES, 0, 3);
+#ifndef RW_METALGL
 	glFinish();	// the shared textures must be complete before Metal reads them
+#endif
 
 	bool ok = mfxRun(gJit[0]*gMfxJitterSignX, gJit[1]*gMfxJitterSignY, gHistValid ? 0 : 1) != 0;
 	if(ok){
@@ -2464,7 +2466,9 @@ rsRayTracePass(void)
 	glUniform1i(glGetUniformLocation(rsRTPrepProg, "reflTex"), 1);
 	glUniform1i(glGetUniformLocation(rsRTPrepProg, "div"), gRTDiv);
 	glDrawArrays(GL_TRIANGLES, 0, 3);
-	glFinish();
+#ifndef RW_METALGL
+	glFinish();	// (the Metal build orders the ray tracing on the renderer's own queue instead)
+#endif
 
 	gRTEnv.maxDistance = gRTDistance;
 	gRTEnv.fogDistance = gRTDistance*0.8f;
