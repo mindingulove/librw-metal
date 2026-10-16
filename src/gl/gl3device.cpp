@@ -302,7 +302,11 @@ static double gSceneFrameStart;
 static inline bool sceneQueriesUsable(void){ return glGenQueries && glBeginQuery && glEndQuery && glGetQueryObjectuiv && glGetQueryObjectui64v; }
 static double gCollectAcc;	// time spent registering geometry with the ray tracer this frame
 static inline double perfNow(void){ return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
-extern "C" void regtaPerfGet(float *ms){ ms[0] = gPerfMs[0]; ms[1] = gPerfMs[1]; ms[2] = gPerfMs[2]; ms[3] = gPerfMs[3]; ms[4] = gPerfMs[4]; ms[5] = gPerfMs[5]; }
+extern "C" void regtaPerfGet(float *ms){ ms[0] = gPerfMs[0]; ms[1] = gPerfMs[1]; ms[2] = gPerfMs[2]; ms[3] = gPerfMs[3]; ms[4] = gPerfMs[4]; ms[5] = gPerfMs[5];
+#ifdef RW_METALGL
+	ms[5] = mtlglGpuMs();
+#endif
+}
 extern "C" int regtaEnableGLMultithreading(void);
 static int gGLMultithread = 1;	// re3.ini [Graphics] GLMultithread=0 turns Apple's multithreaded GL engine off
 static bool gMetalFX = false;		// re3.ini [Graphics] RenderMetalFX=1: MetalFX temporal scaler instead of the GLSL resolve

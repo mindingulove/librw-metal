@@ -24,7 +24,8 @@ void *mtlglDevice(void);
 void *mtlglCommandQueue(void);
 void *mtlglTexture(unsigned int glName);	// id<MTLTexture> (bridged, not retained); creates it when needed
 unsigned int mtlglWrapTexture(void *mtlTexture);	// GL name for an existing id<MTLTexture>
-void mtlglFlush(void);	// ends the current pass and submits the work recorded so far
+void mtlglFlush(void);
+float mtlglGpuMs(void);	// GPU time per frame (all command buffers, smoothed)	// ends the current pass and submits the work recorded so far
 
 #ifdef __cplusplus
 }

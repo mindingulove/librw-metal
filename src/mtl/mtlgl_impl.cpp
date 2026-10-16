@@ -171,6 +171,9 @@ struct Ctx {
 	id<MTLCommandBuffer> cb = nil;
 	id<MTLRenderCommandEncoder> enc = nil;
 	std::atomic<uint64_t> completed{0};
+	std::atomic<uint64_t> gpuNs{0};	// GPU time of all finished command buffers
+	uint64_t gpuNsAtPresent = 0;
+	float gpuMs = 0.0f;
 	uint64_t serial = 1;	// serial of the command buffer being recorded
 
 	// object tables (index = GL name)
@@ -258,6 +261,8 @@ cmd(void)
 		G->cb = [G->queue commandBuffer];
 		uint64_t s = G->serial;
 		[G->cb addCompletedHandler:^(id<MTLCommandBuffer> b){
+			double t = b.GPUEndTime - b.GPUStartTime;
+			if(t > 0.0 && t < 1.0) G->gpuNs.fetch_add((uint64_t)(t*1e9));
 			uint64_t cur = G->completed.load();
 			while(cur < s && !G->completed.compare_exchange_weak(cur, s)) {}
 		}];
@@ -2067,6 +2072,12 @@ mtlglPresent(void)
 			[cmd() presentDrawable:dr];
 		}
 		submit(false);
+		{
+			uint64_t now = G->gpuNs.load();
+			float ms = (float)((now - G->gpuNsAtPresent)/1.0e6);
+			G->gpuNsAtPresent = now;
+			G->gpuMs += (ms - G->gpuMs)*0.05f;
+		}
 		// follow the window: a changed backing size means a new default framebuffer
 		NSView *v = G->window.contentView;
 		NSRect b = [v convertRectToBacking:v.bounds];
@@ -2095,3 +2106,5 @@ extern "C" unsigned int mtlglWrapTexture(void *mtlTexture)
 	t->minF = t->magF = GL_NEAREST; t->wrapS = t->wrapT = GL_CLAMP_TO_EDGE;
 	return addObj(G->texs, t);
 }
+
+extern "C" float mtlglGpuMs(void){ return G ? G->gpuMs : 0.0f; }
