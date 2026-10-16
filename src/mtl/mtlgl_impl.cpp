@@ -397,16 +397,16 @@ convertPixels(MTLPixelFormat mf, GLenum format, GLenum type, int w, int h, const
 			uint8_t R, Gc, B, A = 255;
 			if(type == GL_UNSIGNED_SHORT_5_5_5_1){
 				uint16_t v = ((const uint16_t*)r)[x];
-				R = ((v >> 11) & 31)*255/31; Gc = ((v >> 6) & 31)*255/31; B = ((v >> 1) & 31)*255/31; A = (v & 1) ? 255 : 0;
+				R = ((((v >> 11) & 31)*255+15)/31); Gc = ((((v >> 6) & 31)*255+15)/31); B = ((((v >> 1) & 31)*255+15)/31); A = (v & 1) ? 255 : 0;
 			}else if(type == GL_UNSIGNED_SHORT_5_6_5){
 				uint16_t v = ((const uint16_t*)r)[x];
-				R = ((v >> 11) & 31)*255/31; Gc = ((v >> 5) & 63)*255/63; B = (v & 31)*255/31;
+				R = ((((v >> 11) & 31)*255+15)/31); Gc = ((((v >> 5) & 63)*255+31)/63); B = (((v & 31)*255+15)/31);
 			}else if(type == GL_UNSIGNED_SHORT_4_4_4_4){
 				uint16_t v = ((const uint16_t*)r)[x];
 				R = ((v >> 12) & 15)*17; Gc = ((v >> 8) & 15)*17; B = ((v >> 4) & 15)*17; A = (v & 15)*17;
 			}else if(type == GL_UNSIGNED_SHORT_1_5_5_5_REV){
 				uint16_t v = ((const uint16_t*)r)[x];
-				B = (v & 31)*255/31; Gc = ((v >> 5) & 31)*255/31; R = ((v >> 10) & 31)*255/31; A = (v & 0x8000) ? 255 : 0;
+				B = (((v & 31)*255+15)/31); Gc = ((((v >> 5) & 31)*255+15)/31); R = ((((v >> 10) & 31)*255+15)/31); A = (v & 0x8000) ? 255 : 0;
 			}else if(type == GL_UNSIGNED_INT_8_8_8_8_REV){
 				const uint8_t *p = r + x*4;
 				if(format == GL_BGRA){ B = p[0]; Gc = p[1]; R = p[2]; A = p[3]; }
@@ -474,12 +474,14 @@ ensureTex(Tex *t)
 	if(n > t->maxLevel + 1) n = t->maxLevel + 1;
 	if(n > full) n = full;
 	if(t->genMips) n = full;
+	if(n > t->maxLevel + 1) n = t->maxLevel + 1;	// GL_TEXTURE_MAX_LEVEL limits generated chains too
 	if(n < 1) n = 1;
 	MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:t->fmt width:t->w height:t->h mipmapped:NO];
 	d.mipmapLevelCount = n;
 	d.storageMode = MTLStorageModeShared;
 	d.usage = MTLTextureUsageShaderRead | (t->compressed ? 0 : (MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView));
 	if(t->depth){ d.storageMode = MTLStorageModePrivate; d.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget; }
+	if(t->ifmt == GL_COMPRESSED_RGB_S3TC_DXT1_EXT) d.swizzle = MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue, MTLTextureSwizzleOne);
 	t->mtl = [G->dev newTextureWithDescriptor:d];
 	if(!t->mtl){ logf_("texture creation failed %dx%d fmt %d", t->w, t->h, (int)t->fmt); return false; }
 	t->created = n;
@@ -800,6 +802,14 @@ drawCommon(GLenum mode, GLsizei count, GLenum idxType, size_t idxOff, bool index
 	if(!compileProg(p)) return;
 	Fbo *f = fboOf(G->drawFbo);
 	if(!f) return;
+	// Metal textures are created (and uploaded, which may need a blit pass) before the render pass of this draw begins
+	Tex *sampled[16] = {};
+	for(size_t i = 0; i < p->tr.samplers.size() && i < 16; i++){
+		int unit = p->samplerUnit[i];
+		if(unit < 0 || unit > 15) unit = 0;
+		Tex *t = p->tr.samplers[i].rect ? texOf(G->unitTexRect[unit]) : texOf(G->unitTex2D[unit]);
+		if(t && ensureTex(t)) sampled[i] = t;
+	}
 	if(!beginPass(f)) return;
 	Vao *vao = G->vao < G->vaos.size() ? G->vaos[G->vao] : nullptr;
 	if(!vao) return;
@@ -1001,9 +1011,9 @@ drawCommon(GLenum mode, GLsizei count, GLenum idxType, size_t idxOff, bool index
 		auto &sm = p->tr.samplers[i];
 		int unit = p->samplerUnit[i];
 		if(unit < 0 || unit > 15) unit = 0;
-		Tex *t = sm.rect ? texOf(G->unitTexRect[unit]) : texOf(G->unitTex2D[unit]);
+		Tex *t = i < 16 ? sampled[i] : nullptr;
 		id<MTLTexture> mt = nil; id<MTLSamplerState> ss = nil;
-		if(t && ensureTex(t)){ mt = t->mtl; t->lastUse = G->serial; ss = samplerFor(t); }
+		if(t){ mt = t->mtl; t->lastUse = G->serial; ss = samplerFor(t); }
 		if(!mt){
 			if(!G->blackTex){
 				MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:1 height:1 mipmapped:NO];
@@ -1294,9 +1304,10 @@ static void texImage(Tex *t, int level, GLenum ifmt, int w, int h, GLenum format
 	if(level == 0){
 		bool d, c;
 		MTLPixelFormat f = mtlFormatFor(ifmt, &d, &c);
-		if(t->mtl && (t->w != w || t->h != h || t->fmt != f)){ t->mtl = nil; t->created = 0; }
+		bool changed = t->w != w || t->h != h || t->fmt != f || t->ifmt != ifmt;
+		if(t->mtl && changed){ t->mtl = nil; t->created = 0; }
 		t->w = w; t->h = h; t->fmt = f; t->depth = d; t->compressed = c; t->ifmt = ifmt;
-		if(!t->mtl) t->lv.clear();
+		if(changed) t->lv.clear();
 	}
 	if((int)t->lv.size() <= level) t->lv.resize(level + 1);
 	Level &l = t->lv[level];
