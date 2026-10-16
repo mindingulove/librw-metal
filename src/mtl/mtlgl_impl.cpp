@@ -896,9 +896,13 @@ drawCommon(GLenum mode, GLsizei count, GLenum idxType, size_t idxOff, bool index
 			vd.layouts[s].stride = key.stride[s];
 			vd.layouts[s].stepFunction = MTLVertexStepFunctionPerVertex;
 		}
-		vd.layouts[15].stride = 16;
-		vd.layouts[15].stepFunction = MTLVertexStepFunctionConstant;
-		vd.layouts[15].stepRate = 0;
+		bool usesZero = false;
+		for(int i = 0; i < key.nAttr; i++) if(key.a[i].slot == 15) usesZero = true;
+		if(usesZero){
+			vd.layouts[15].stride = 16;
+			vd.layouts[15].stepFunction = MTLVertexStepFunctionConstant;
+			vd.layouts[15].stepRate = 0;
+		}
 		d.vertexDescriptor = vd;
 		for(int i = 0; i < 4; i++){
 			if(!key.colorFmt[i]) continue;
