@@ -2,6 +2,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <unordered_map>
+#include <array>
 
 #include "../rwbase.h"
 #include "../rwerror.h"
@@ -26,7 +28,8 @@ namespace gl3 {
 
 static Shader *skinShader, *skinShader_noAT;
 static Shader *skinShader_fullLight, *skinShader_fullLight_noAT;
-static int32 u_boneMatrices;
+static int32 u_boneMatrices,u_prevBoneMatrices;
+extern "C" int regtaRenderFrameIndex(void);
 
 void
 skinInstanceCB(Geometry *geo, InstanceDataHeader *header, bool32 reinstance)
@@ -211,11 +214,11 @@ skinUninstanceCB(Geometry *geo, InstanceDataHeader *header)
 static float skinMatrices[64*16];
 
 void
-uploadSkinMatrices(Atomic *a)
+getSkinMatrices(Atomic *a, float *out)
 {
 	int i;
 	Skin *skin = Skin::get(a->geometry);
-	Matrix *m = (Matrix*)skinMatrices;
+	Matrix *m = (Matrix*)out;
 	HAnimHierarchy *hier = Skin::getHierarchy(a);
 
 	if(hier){
@@ -245,6 +248,23 @@ uploadSkinMatrices(Atomic *a)
 			m++;
 		}
 	}
+}
+
+void
+uploadSkinMatrices(Atomic *a)
+{
+	getSkinMatrices(a, skinMatrices);
+	struct PoseHistory{std::array<float,1024> current{},previous{};int frame=-100;Geometry *geometry=nullptr;};
+	static std::unordered_map<Atomic*,PoseHistory> history;
+	if(history.size()>256)history.clear();
+	auto &h=history[a];int frame=regtaRenderFrameIndex();
+	if(h.frame!=frame){
+		if(h.frame==frame-1 && h.geometry==a->geometry)h.previous=h.current;
+		else memcpy(h.previous.data(),skinMatrices,sizeof(float)*1024);
+		h.frame=frame;h.geometry=a->geometry;
+	}
+	memcpy(h.current.data(),skinMatrices,sizeof(float)*1024);
+	setUniform(u_prevBoneMatrices,h.previous.data());
 	setUniform(u_boneMatrices, skinMatrices);
 }
 
@@ -255,6 +275,7 @@ skinRenderCB(Atomic *atomic, InstanceDataHeader *header)
 
 	uint32 flags = atomic->geometry->flags;
 	setWorldMatrix(atomic->getFrame()->getLTM());
+	rtCollect(atomic, header);
 	int32 vsBits = lightingCB(atomic);
 
 	setupVertexInput(header);
@@ -338,6 +359,7 @@ void
 initSkin(void)
 {
 	u_boneMatrices = registerUniform("u_boneMatrices", UNIFORM_MAT4, 64);
+	u_prevBoneMatrices = registerUniform("u_prevBoneMatrices",UNIFORM_MAT4,64);
 
 	Driver::registerPlugin(PLATFORM_GL3, 0, ID_SKIN,
 	                       skinOpen, skinClose);

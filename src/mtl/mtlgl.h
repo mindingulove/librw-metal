@@ -19,6 +19,11 @@ void mtlglSetVsync(int interval);
 // The size of the default framebuffer changed (window resized / moved to another screen).
 void mtlglResize(int widthPx, int heightPx);
 
+// Native scene MSAA. Resolve colour coverage and select a single nearest-depth surface for motion/reflection tags.
+int mtlglBeginSceneMSAA(unsigned int framebuffer, int samples);
+int mtlglResolveSceneMSAA(unsigned int framebuffer);
+int mtlglSceneMSAASamples(unsigned int framebuffer);
+
 // Interop for the Metal compute passes (ray tracing, MetalFX): the Metal objects behind GL object names.
 void *mtlglDevice(void);
 void *mtlglCommandQueue(void);
@@ -30,3 +35,6 @@ float mtlglGpuMs(void);	// GPU time per frame (all command buffers, smoothed)	//
 #ifdef __cplusplus
 }
 #endif
+
+// Query hardware sample counts; never advertise emulated samples as native MSAA.
+extern "C" int mtlglSupportsSamples(int samples);

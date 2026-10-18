@@ -40,6 +40,7 @@ matfxDefaultRender(InstanceDataHeader *header, InstanceData *inst, int32 vsBits,
 	setMaterial(flags, m->color, m->surfaceProps);
 
 	setTexture(0, m->texture);
+	setGlassForTexture(m->texture);
 
 	rw::SetRenderState(VERTEXALPHA, inst->vertexAlpha || m->color.alpha != 0xFF);
 
@@ -98,7 +99,8 @@ matfxEnvRender(InstanceDataHeader *header, InstanceData *inst, int32 vsBits, uin
 	Material *m;
 	m = inst->material;
 
-	if(env->tex == nil || env->coefficient == 0.0f){
+	// Trace glass in the standard pass instead of clearing its ray metadata in the legacy environment pass.
+	if(setGlassForTexture(m->texture) || env->tex == nil || env->coefficient == 0.0f){
 		matfxDefaultRender(header, inst, vsBits, flags);
 		return;
 	}

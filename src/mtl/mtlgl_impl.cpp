@@ -21,6 +21,7 @@
 #include <map>
 #include <algorithm>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "../gl/glad/glad.h"
 #include "mtlgl.h"
@@ -98,6 +99,9 @@ struct Rb { id<MTLTexture> mtl = nil; int w = 0, h = 0; GLenum fmt = 0; };
 struct Attach { Tex *tex = nullptr; Rb *rb = nullptr; int level = 0; };
 
 struct Fbo {
+	id<MTLTexture> msColor[3] = {}, msDepth = nil;
+	int msSamples = 1;
+	bool msActive = false;
 	Attach color[4];
 	Attach depth;	// depth/stencil
 	GLenum drawBuf[4] = { GL_COLOR_ATTACHMENT0, GL_NONE, GL_NONE, GL_NONE };
@@ -156,6 +160,7 @@ struct PsoKey {
 	uint32_t depthFmt, stencilFmt;
 	uint8_t flip;
 	uint8_t nAttr;
+	uint8_t samples;
 	uint8_t pad[2];
 	struct A { uint8_t fmt, slot; uint16_t off; } a[8];
 	uint16_t stride[8];
@@ -258,6 +263,8 @@ struct Ctx {
 	// internal shaders (clear, blit)
 	id<MTLLibrary> utilLib = nil;
 	std::unordered_map<uint64_t, id<MTLRenderPipelineState>> utilPsos;
+	id<MTLLibrary> msResolveLib = nil;
+	std::unordered_map<uint64_t,id<MTLRenderPipelineState>> msResolvePsos;
 };
 
 static Ctx *G = nullptr;
@@ -489,7 +496,11 @@ fullLevels(int w, int h)
 static void
 uploadLevel(Tex *t, int level, const void *bytes, size_t rowBytes, int w, int h)
 {
-	t->uploaded = true;
+	if(!t->mtl || level < 0 || level >= (int)t->mtl.mipmapLevelCount || w <= 0 || h <= 0 ||
+       w > (int)std::max((NSUInteger)1,t->mtl.width >> level) || h > (int)std::max((NSUInteger)1,t->mtl.height >> level)){
+        logf_("rejected invalid texture upload: tex=%u level=%d size=%dx%d",t->name,level,w,h);return;
+    }
+    t->uploaded = true;
 	if(t->lastUse != 0 && t->lastUse > G->completed.load()){
 		// the GPU may still read this texture: go through a staging buffer and a blit
 		size_t total = rowBytes*(size_t)(t->compressed ? (h + 3)/4 : h);
@@ -513,17 +524,22 @@ uploadLevel(Tex *t, int level, const void *bytes, size_t rowBytes, int w, int h)
 static bool
 ensureTex(Tex *t)
 {
-	if(t->mtl) return true;
 	if(t->w <= 0 || t->h <= 0 || t->fmt == MTLPixelFormatInvalid) return false;
 	int specified = 0;
 	while(specified < (int)t->lv.size() && t->lv[specified].w > 0) specified++;
 	int full = fullLevels(t->w, t->h);
 	int n = specified > 0 ? specified : 1;
+    // librw declares its complete storage chain with MAX_LEVEL before uploading
+    // uncompressed mipmaps using TexSubImage. This is allocation, not auto-mipping.
+    if(t->maxLevel < 1000) n = std::max(n,std::min(full,t->maxLevel+1));
 	if(n > t->maxLevel + 1) n = t->maxLevel + 1;
 	if(n > full) n = full;
 	if(t->genMips) n = full;
 	if(n > t->maxLevel + 1) n = t->maxLevel + 1;	// GL_TEXTURE_MAX_LEVEL limits generated chains too
 	if(n < 1) n = 1;
+    if(t->mtl && t->created >= n) return true;
+    id<MTLTexture> previous = t->mtl;
+    int previousLevels = t->created;
 	MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:t->fmt width:t->w height:t->h mipmapped:NO];
 	d.mipmapLevelCount = n;
 	d.storageMode = MTLStorageModeShared;
@@ -534,6 +550,14 @@ ensureTex(Tex *t)
 	if(!t->mtl){ logf_("texture creation failed %dx%d fmt %d", t->w, t->h, (int)t->fmt); return false; }
 	t->created = n;
 	t->lastUse = 0;
+    if(previous){
+        endEncoder();auto bl=newBlit();
+        for(int i=0;i<previousLevels;i++)
+            [bl copyFromTexture:previous sourceSlice:0 sourceLevel:i sourceOrigin:MTLOriginMake(0,0,0)
+                sourceSize:MTLSizeMake(std::max((NSUInteger)1,previous.width>>i),std::max((NSUInteger)1,previous.height>>i),1)
+                toTexture:t->mtl destinationSlice:0 destinationLevel:i destinationOrigin:MTLOriginMake(0,0,0)];
+        [bl endEncoding];t->lastUse=G->serial;
+    }
 	gStats.uploads++;
 	if(dbgOn()){
 		int withData = 0;
@@ -547,7 +571,7 @@ ensureTex(Tex *t)
 			if(l.w > 0 && !l.data.empty()){
 				size_t rb;
 				levelBytes(t->fmt, l.w, l.h, &rb);
-				[t->mtl replaceRegion:MTLRegionMake2D(0, 0, l.w, l.h) mipmapLevel:i withBytes:l.data.data() bytesPerRow:rb];
+				uploadLevel(t,i,l.data.data(),rb,l.w,l.h);
 				std::vector<uint8_t>().swap(l.data);
 				t->uploaded = true;
 				if(i == 0) any = true;
@@ -640,6 +664,7 @@ beginPass(Fbo *f)
 {
 	id<MTLTexture> color[4], depth;
 	fboTargets(f, color, &depth);
+	if(f->msActive){for(int i=0;i<3;i++)color[i]=f->msColor[i];depth=f->msDepth;}
 	if(!color[0] && !color[1] && !color[2] && !color[3] && !depth) return false;
 	if(G->enc && G->es.fbo == f && G->es.depth == depth && !fboHasPending(f)){
 		bool same = true;
@@ -735,9 +760,9 @@ fragment float4 util_blit_fs(VOut in [[stage_in]], texture2d<float> t [[texture(
 )MSL";
 
 static id<MTLRenderPipelineState>
-utilPso(bool blit, MTLPixelFormat color[4], MTLPixelFormat depth, MTLColorWriteMask masks[4])
+utilPso(bool blit, MTLPixelFormat color[4], MTLPixelFormat depth, MTLColorWriteMask masks[4], NSUInteger samples=1)
 {
-	uint64_t key = blit ? 1 : 0;
+	uint64_t key = (blit ? 1 : 0)+samples*2;
 	for(int i = 0; i < 4; i++) key = key*131 + (uint64_t)color[i]*7 + masks[i];
 	key = key*131 + (uint64_t)depth;
 	auto it = G->utilPsos.find(key);
@@ -754,6 +779,7 @@ utilPso(bool blit, MTLPixelFormat color[4], MTLPixelFormat depth, MTLColorWriteM
 		d.colorAttachments[i].pixelFormat = color[i];
 		d.colorAttachments[i].writeMask = masks[i];
 	}
+	d.rasterSampleCount=samples;
 	d.depthAttachmentPixelFormat = depth;
 	if(depth == MTLPixelFormatDepth32Float_Stencil8) d.stencilAttachmentPixelFormat = depth;
 	NSError *e = nil;
@@ -1004,6 +1030,7 @@ drawCommon(GLenum mode, GLsizei count, GLenum idxType, size_t idxOff, bool index
 	key.depthFmt = dt ? (uint32_t)dt.pixelFormat : 0;
 	key.stencilFmt = (dt && dt.pixelFormat == MTLPixelFormatDepth32Float_Stencil8) ? (uint32_t)dt.pixelFormat : 0;
 	key.flip = 1;
+	key.samples = (uint8_t)(ct[0] ? ct[0].sampleCount : dt ? dt.sampleCount : 1);
 
 	id<MTLRenderPipelineState> pso;
 	static PsoKey lastKey; static id<MTLRenderPipelineState> lastPso = nil;
@@ -1038,6 +1065,7 @@ drawCommon(GLenum mode, GLsizei count, GLenum idxType, size_t idxOff, bool index
 			vd.layouts[kZeroSlot].stepRate = 0;
 		}
 		d.vertexDescriptor = vd;
+		d.rasterSampleCount=key.samples;
 		for(int i = 0; i < 4; i++){
 			if(!key.colorFmt[i]) continue;
 			MTLRenderPipelineColorAttachmentDescriptor *ca = d.colorAttachments[i];
@@ -1452,6 +1480,8 @@ MGL void mgl_glTexParameterf(GLenum target, GLenum pname, GLfloat v)
 // (re)specifies a level. data may be null (storage only).
 static void texImage(Tex *t, int level, GLenum ifmt, int w, int h, GLenum format, GLenum type, const void *data, size_t compressedSize)
 {
+    if(level<0 || level>30 || w<=0 || h<=0) return;
+    if(level>0 && (t->w<=0 || level>=fullLevels(t->w,t->h) || w!=std::max(1,t->w>>level) || h!=std::max(1,t->h>>level))){logf_("rejected invalid mip definition %u level %d",t->name,level);return;}
 	if(level == 0){
 		bool d, c;
 		MTLPixelFormat f = mtlFormatFor(ifmt, &d, &c);
@@ -1468,7 +1498,7 @@ static void texImage(Tex *t, int level, GLenum ifmt, int w, int h, GLenum format
 	if(compressedSize) px.assign((const uint8_t*)data, (const uint8_t*)data + compressedSize);
 	else convertPixels(t->fmt, format, type, w, h, data, px);
 	if(dbgOn() && t->mtl && level >= t->created) logf_("tex %u late level %d (created %d)", t->name, level, t->created);
-	if(t->mtl && level < t->created){
+	if(t->mtl && ensureTex(t) && level < t->created){
 		size_t rb;
 		levelBytes(t->fmt, w, h, &rb);
 		uploadLevel(t, level, px.data(), rb, w, h);
@@ -1488,7 +1518,7 @@ MGL void mgl_glCompressedTexImage2D(GLenum target, GLint level, GLenum ifmt, GLs
 MGL void mgl_glTexSubImage2D(GLenum target, GLint level, GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, GLenum type, const void *data)
 {
 	Tex *t = boundTex(target);
-	if(!t || !data || !ensureTex(t)) return;
+	if(!t || !data || !ensureTex(t) || level < 0 || level >= t->created || x<0 || y<0 || w<=0 || h<=0 || x+w>std::max(1,t->w>>level) || y+h>std::max(1,t->h>>level)) return;
 	std::vector<uint8_t> px;
 	convertPixels(t->fmt, format, type, w, h, data, px);
 	size_t rb; levelBytes(t->fmt, w, h, &rb);
@@ -1626,7 +1656,7 @@ clearByDraw(Fbo *f, GLbitfield mask, const float *colorVals /* [4][4] or null */
 	}
 	MTLPixelFormat df = G->es.depth ? G->es.depth.pixelFormat : MTLPixelFormatInvalid;
 	if(!tw && G->es.depth){ tw = (int)G->es.depth.width; th = (int)G->es.depth.height; }
-	id<MTLRenderPipelineState> pso = utilPso(false, cf, df, masks);
+	id<MTLRenderPipelineState> pso = utilPso(false, cf, df, masks, G->es.color[0] ? G->es.color[0].sampleCount : G->es.depth.sampleCount);
 	if(!pso) return;
 	id<MTLRenderCommandEncoder> enc = G->enc;
 	[enc setRenderPipelineState:pso];
@@ -1707,7 +1737,7 @@ readTarget(Fbo *f)
 MGL void mgl_glCopyTexSubImage2D(GLenum target, GLint level, GLint xo, GLint yo, GLint x, GLint y, GLsizei w, GLsizei h)
 {
 	Tex *t = boundTex(target);
-	if(!t || !ensureTex(t)) return;
+	if(!t || !ensureTex(t) || level<0 || level>=t->created || xo<0 || yo<0 || xo+w>std::max(1,t->w>>level) || yo+h>std::max(1,t->h>>level)) return;
 	id<MTLTexture> src = readTarget(fboOf(G->readFbo));
 	if(!src) return;
 	endEncoder();
@@ -1789,10 +1819,23 @@ MGL void mgl_glReadPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum format,
 	id<MTLTexture> src = readTarget(fboOf(G->readFbo));
 	if(!src) return;
 	submit(true);
-	size_t bpp = src.pixelFormat == MTLPixelFormatRGBA16Float ? 8 : src.pixelFormat == MTLPixelFormatR8Unorm ? 1 : src.pixelFormat == MTLPixelFormatR32Float ? 4 : 4;
+	size_t bpp = src.pixelFormat == MTLPixelFormatRGBA32Float ? 16 : src.pixelFormat == MTLPixelFormatRGBA16Float ? 8 : src.pixelFormat == MTLPixelFormatR8Unorm ? 1 : src.pixelFormat == MTLPixelFormatR32Float ? 4 : 4;
 	std::vector<uint8_t> raw((size_t)w*h*bpp);
 	[src getBytes:raw.data() bytesPerRow:(size_t)w*bpp fromRegion:MTLRegionMake2D(x, y, w, h) mipmapLevel:0];
 	int comps = format == GL_RGBA || format == GL_BGRA ? 4 : format == GL_RGB || format == GL_BGR ? 3 : 1;
+ if(type==GL_FLOAT){
+  size_t row=((size_t)w*comps*sizeof(float)+G->packAlign-1)/G->packAlign*G->packAlign;
+  for(int yy=0;yy<h;yy++)for(int xx=0;xx<w;xx++){
+   const uint8_t *p=raw.data()+((size_t)yy*w+xx)*bpp;float rgba[4]={0,0,0,1};
+   if(src.pixelFormat==MTLPixelFormatRGBA32Float)memcpy(rgba,p,16);
+   else if(src.pixelFormat==MTLPixelFormatRGBA16Float){const __fp16 *v=(const __fp16*)p;for(int c=0;c<4;c++)rgba[c]=v[c];}
+   else if(src.pixelFormat==MTLPixelFormatR32Float)memcpy(rgba,p,4);
+   else {for(size_t c=0;c<std::min(bpp,(size_t)4);c++)rgba[c]=p[c]/255.f;if(src.pixelFormat==MTLPixelFormatBGRA8Unorm)std::swap(rgba[0],rgba[2]);}
+   if(format==GL_BGRA || format==GL_BGR)std::swap(rgba[0],rgba[2]);
+   memcpy((uint8_t*)out+yy*row+(size_t)xx*comps*sizeof(float),rgba,comps*sizeof(float));
+  }
+  return;
+ }
 	bool bgraSrc = src.pixelFormat == MTLPixelFormatBGRA8Unorm;
 	size_t dstRow = ((size_t)w*comps + G->packAlign - 1)/G->packAlign*G->packAlign;
 	uint8_t *o = (uint8_t*)out;
@@ -1814,7 +1857,7 @@ MGL void mgl_glReadPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum format,
 MGL void mgl_glGetTexImage(GLenum target, GLint level, GLenum format, GLenum type, void *out)
 {
 	Tex *t = boundTex(target);
-	if(!t || !ensureTex(t)) return;
+	if(!t || !out || !ensureTex(t) || level<0 || level>=t->created) return;
 	submit(true);
 	int w = t->w >> level, h = t->h >> level; if(w < 1) w = 1; if(h < 1) h = 1;
 	size_t rb; size_t total = levelBytes(t->fmt, w, h, &rb);
@@ -1867,7 +1910,7 @@ MGL void mgl_glGetTexImage(GLenum target, GLint level, GLenum format, GLenum typ
 MGL void mgl_glGetCompressedTexImage(GLenum target, GLint level, void *out)
 {
 	Tex *t = boundTex(target);
-	if(!t || !ensureTex(t)) return;
+	if(!t || !out || !ensureTex(t) || level<0 || level>=t->created) return;
 	submit(true);
 	int w = t->w >> level, h = t->h >> level; if(w < 1) w = 1; if(h < 1) h = 1;
 	size_t rb; levelBytes(t->fmt, w, h, &rb);
@@ -2070,6 +2113,89 @@ makeDefaultTargets(int w, int h)
 
 }  // namespace
 
+extern "C" int mtlglSupportsSamples(int samples){@autoreleasepool{ id<MTLDevice> dev=G ? G->dev : MTLCreateSystemDefaultDevice();return dev && [dev supportsTextureSampleCount:samples]; }}
+
+extern "C" int mtlglSceneMSAASamples(unsigned framebuffer){if(!G)return 1;Fbo *f=fboOf(framebuffer);return f?f->msSamples:1;}
+
+// Scene-only MSAA: all geometry samples survive encoder breaks; post passes use resolved targets.
+extern "C" int
+mtlglBeginSceneMSAA(unsigned framebuffer,int samples)
+{
+	if(!G) return 0;
+	Fbo *f=fboOf(framebuffer);if(!f || f->isDefault) return 0;
+	if(f->msActive) return f->msSamples;
+	if(samples<=1){f->msSamples=1;return 1;}
+	while(samples>1 && ![G->dev supportsTextureSampleCount:samples])samples/=2;
+	if(samples<=1) return 1;
+	id<MTLTexture> color[4],depth;fboTargets(f,color,&depth);
+	if(!color[0] || !color[1] || !color[2] || !depth) return 0;
+	bool rebuild=f->msSamples!=samples || !f->msDepth || f->msDepth.width!=depth.width || f->msDepth.height!=depth.height || f->msDepth.pixelFormat!=depth.pixelFormat;
+	for(int i=0;i<3;i++)rebuild=rebuild || !f->msColor[i] || f->msColor[i].width!=color[i].width || f->msColor[i].height!=color[i].height || f->msColor[i].pixelFormat!=color[i].pixelFormat;
+	endEncoder();
+	if(rebuild){
+		id<MTLTexture> next[3],nextDepth;
+		for(int i=0;i<4;i++){
+			id<MTLTexture> source=i<3?color[i]:depth;
+			MTLTextureDescriptor *d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:source.pixelFormat width:source.width height:source.height mipmapped:NO];
+			d.textureType=MTLTextureType2DMultisample;d.sampleCount=samples;d.storageMode=MTLStorageModePrivate;
+			d.usage=MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead;
+			id<MTLTexture> texture=[G->dev newTextureWithDescriptor:d];
+			if(!texture){logf_("MSAA allocation failed; retaining single-sample scene");return 0;}
+			if(i<3)next[i]=texture;else nextDepth=texture;
+		}
+		for(int i=0;i<3;i++)f->msColor[i]=next[i];f->msDepth=nextDepth;
+		logf_("native Metal MSAA %dx: %lux%lu",samples,(unsigned long)depth.width,(unsigned long)depth.height);
+	}
+	f->msSamples=samples;f->msActive=true;return samples;
+}
+
+extern "C" int
+mtlglResolveSceneMSAA(unsigned framebuffer)
+{
+	if(!G) return 0;Fbo *f=fboOf(framebuffer);if(!f || !f->msActive)return 1;
+	flushPending(f);endEncoder();
+	id<MTLTexture> color[4],depth;fboTargets(f,color,&depth);
+	if(!G->msResolveLib){
+		static const char *source=R"MSL(
+#include <metal_stdlib>
+using namespace metal;
+vertex float4 ms_vs(uint id [[vertex_id]]){float2 p=float2((id<<1)&2,id&2);return float4(p*2-1,0,1);}
+struct MSOut {float4 color [[color(0)]];float4 velocity [[color(1)]];float4 reflection [[color(2)]];float depth [[depth(any)]];};
+fragment MSOut ms_fs(float4 position [[position]],texture2d_ms<float,access::read> c [[texture(0)]],texture2d_ms<float,access::read> v [[texture(1)]],texture2d_ms<float,access::read> r [[texture(2)]],depth2d_ms<float,access::read> z [[texture(3)]]){
+ uint2 p=uint2(position.xy);uint count=c.get_num_samples(),selected=0;float nearest=1;float4 sum=0;
+ for(uint i=0;i<count;i++){sum+=c.read(p,i);float d=z.read(p,i);if(d<nearest){nearest=d;selected=i;}}
+ MSOut o;o.color=sum/float(count);o.velocity=v.read(p,selected);o.reflection=r.read(p,selected);
+ uint covered=0;for(uint i=0;i<count;i++){float4 sample=v.read(p,i);if(abs(sample.b-o.velocity.b)<0.25f && abs(sample.a-o.velocity.a)<0.25f && abs(z.read(p,i)-nearest)<0.0001f)covered++;}
+ o.reflection.a*=float(covered)/float(count);o.depth=nearest;return o;
+}
+)MSL";
+		NSError *error=nil;G->msResolveLib=[G->dev newLibraryWithSource:[NSString stringWithUTF8String:source] options:nil error:&error];
+		if(!G->msResolveLib){logf_("MSAA resolve library: %s",error.localizedDescription.UTF8String);return 0;}
+	}
+	uint64_t key=(uint64_t)depth.pixelFormat;for(int i=0;i<3;i++)key=key*521+color[i].pixelFormat;
+	auto it=G->msResolvePsos.find(key);id<MTLRenderPipelineState> pipeline;
+	if(it!=G->msResolvePsos.end())pipeline=it->second;
+	else{
+		MTLRenderPipelineDescriptor *d=[MTLRenderPipelineDescriptor new];d.vertexFunction=[G->msResolveLib newFunctionWithName:@"ms_vs"];d.fragmentFunction=[G->msResolveLib newFunctionWithName:@"ms_fs"];
+		for(int i=0;i<3;i++)d.colorAttachments[i].pixelFormat=color[i].pixelFormat;
+		d.depthAttachmentPixelFormat=depth.pixelFormat;
+		if(depth.pixelFormat==MTLPixelFormatDepth32Float_Stencil8)d.stencilAttachmentPixelFormat=depth.pixelFormat;
+		NSError *error=nil;pipeline=[G->dev newRenderPipelineStateWithDescriptor:d error:&error];
+		if(!pipeline){logf_("MSAA resolve pipeline: %s",error.localizedDescription.UTF8String);return 0;}
+		G->msResolvePsos[key]=pipeline;
+	}
+	MTLRenderPassDescriptor *pd=[MTLRenderPassDescriptor renderPassDescriptor];
+	for(int i=0;i<3;i++){pd.colorAttachments[i].texture=color[i];pd.colorAttachments[i].loadAction=MTLLoadActionDontCare;pd.colorAttachments[i].storeAction=MTLStoreActionStore;}
+	pd.depthAttachment.texture=depth;pd.depthAttachment.loadAction=MTLLoadActionDontCare;pd.depthAttachment.storeAction=MTLStoreActionStore;
+	if(depth.pixelFormat==MTLPixelFormatDepth32Float_Stencil8){pd.stencilAttachment.texture=depth;pd.stencilAttachment.loadAction=MTLLoadActionDontCare;pd.stencilAttachment.storeAction=MTLStoreActionDontCare;}
+	id<MTLRenderCommandEncoder> enc=[cmd() renderCommandEncoderWithDescriptor:pd];
+	MTLDepthStencilDescriptor *ds=[MTLDepthStencilDescriptor new];ds.depthCompareFunction=MTLCompareFunctionAlways;ds.depthWriteEnabled=YES;
+	[enc setDepthStencilState:[G->dev newDepthStencilStateWithDescriptor:ds]];[enc setRenderPipelineState:pipeline];[enc setCullMode:MTLCullModeNone];
+	for(int i=0;i<3;i++)[enc setFragmentTexture:f->msColor[i] atIndex:i];[enc setFragmentTexture:f->msDepth atIndex:3];
+	[enc setViewport:(MTLViewport){0,0,(double)depth.width,(double)depth.height,0,1}];[enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];[enc endEncoding];
+	gStats.passes++;f->msActive=false;return 1;
+}
+
 extern "C" int
 mtlglInit(void *nsWindow, int w, int h)
 {
@@ -2139,6 +2265,39 @@ mtlglResize(int w, int h)
 	}
 }
 
+// Frame capture without screen recording: when a file named "capture_frames" appears in the game folder, the next
+// 24 frames the game draws are saved to capture/frameNN.ppm (only the game's own image, nothing else on screen).
+static void
+captureFrames(void)
+{
+	static int left = 0, n = 0, check = 0;
+	if(left == 0){
+		if(++check < 30) return;
+		check = 0;
+		if(access("capture_frames", F_OK) != 0) return;
+		unlink("capture_frames");
+		mkdir("capture", 0755);
+		left = 24; n = 0;
+	}
+	submit(true);
+	int w = G->fbW, h = G->fbH;
+	std::vector<uint8_t> px((size_t)w*h*4);
+	[G->defColor->mtl getBytes:px.data() bytesPerRow:(size_t)w*4 fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
+	char name[64];
+	snprintf(name, sizeof(name), "capture/frame%02d.ppm", n++);
+	if(FILE *f = fopen(name, "wb")){
+		fprintf(f, "P6\n%d %d\n255\n", w, h);
+		std::vector<uint8_t> row((size_t)w*3);
+		for(int y = h - 1; y >= 0; y--){	// row 0 is the bottom (OpenGL order)
+			const uint8_t *src = &px[(size_t)y*w*4];
+			for(int x = 0; x < w; x++){ row[x*3] = src[x*4]; row[x*3 + 1] = src[x*4 + 1]; row[x*3 + 2] = src[x*4 + 2]; }
+			fwrite(row.data(), 1, row.size(), f);
+		}
+		fclose(f);
+	}
+	left--;
+}
+
 extern "C" void
 mtlglPresent(void)
 {
@@ -2146,6 +2305,7 @@ mtlglPresent(void)
 	@autoreleasepool {
 		flushPending(G->defFbo);
 		endEncoder();
+		captureFrames();
 		id<CAMetalDrawable> dr = [G->layer nextDrawable];
 		if(dr){
 			MTLRenderPassDescriptor *pd = [MTLRenderPassDescriptor renderPassDescriptor];

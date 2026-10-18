@@ -165,6 +165,7 @@ defaultRenderCB(Atomic *atomic, InstanceDataHeader *header)
 		setMaterial(flags, m->color, m->surfaceProps);
 
 		setTexture(0, m->texture);
+		setGlassForTexture(m->texture);
 
 		rw::SetRenderState(VERTEXALPHA, inst->vertexAlpha || m->color.alpha != 0xFF);
 

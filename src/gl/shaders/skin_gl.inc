@@ -1,5 +1,6 @@
 const char *skin_vert_src =
 "uniform mat4 u_boneMatrices[64];\n"
+"uniform mat4 u_prevBoneMatrices[64];\n"
 
 "VSIN(ATTRIB_POS)	vec3 in_pos;\n"
 
@@ -11,15 +12,17 @@ const char *skin_vert_src =
 "main(void)\n"
 "{\n"
 "	vec3 SkinVertex = vec3(0.0, 0.0, 0.0);\n"
+"	vec3 PreviousSkinVertex=vec3(0.0);\n"
 "	vec3 SkinNormal = vec3(0.0, 0.0, 0.0);\n"
 "	for(int i = 0; i < 4; i++){\n"
 "		SkinVertex += (u_boneMatrices[int(in_indices[i])] * vec4(in_pos, 1.0)).xyz * in_weights[i];\n"
+"		PreviousSkinVertex += (u_prevBoneMatrices[int(in_indices[i])] * vec4(in_pos,1.0)).xyz * in_weights[i];\n"
 "		SkinNormal += (mat3(u_boneMatrices[int(in_indices[i])]) * in_normal) * in_weights[i];\n"
 "	}\n"
 
 "	vec4 Vertex = u_world * vec4(SkinVertex, 1.0);\n"
 "	gl_Position = u_proj * u_view * Vertex;\n"
-"	VELOCITY_VS(Vertex, SkinVertex);\n"
+"	VELOCITY_VS(Vertex, PreviousSkinVertex);\n"
 "	vec3 Normal = mat3(u_world) * SkinNormal;\n"
 
 "	v_tex0 = in_tex0;\n"

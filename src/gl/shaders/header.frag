@@ -29,20 +29,30 @@ void DoAlphaTest(float a)
 #endif
 }
 
+#ifdef WET_SURFACE
+uniform vec4 u_glassRefl; // strength, owner, vehicle flag
+#endif
+
 #if defined(HAS_VEL_OUT) && defined(VEL_PIPE)
 layout(location = 1) out vec4 velOut;
 FSIN vec4 v_posCur;
 FSIN vec4 v_posPrev;
 uniform float u_velOn;
+uniform float u_actorId;
 float groundMark = 0.0;	// 1: level ground that applies the traced shadow itself (see DoWet)
 void WriteVel(void)
 {
 	vec2 a = v_posCur.xy/v_posCur.w;
 	vec2 b = v_posPrev.xy/v_posPrev.w;
 #ifdef PED_MARK
-	velOut = vec4((a - b)*0.5, groundMark, u_velOn*2.0);	// 2 = character
+	velOut = vec4((a - b)*0.5, u_velOn>0.5?u_actorId:groundMark, u_velOn*2.0);	// 2 = character
 #else
-	velOut = vec4((a - b)*0.5, groundMark, u_velOn);
+	velOut = vec4((a - b)*0.5, u_velOn>0.5?u_actorId:groundMark, u_velOn);
+#ifdef WET_SURFACE
+	if(u_glassRefl.x>0.001 && u_glassRefl.z>0.5){
+		velOut.b=-u_glassRefl.y;velOut.a=-max(gl_FragCoord.z,1.0e-8);
+	}
+#endif
 #endif
 }
 #define WRITE_VEL() WriteVel()
@@ -61,10 +71,13 @@ uniform sampler2D u_glossTex;	// the neo road gloss texture of this material
 uniform float u_glossMult;	// 0 when the material has none
 uniform float u_roadPuddles;	// 1: rain puddles on, 0: only the faint wet film
 uniform sampler2D u_rtPrev;	// last frame's ray traced reflections (screen space, already softened)
+uniform vec2 u_rtPrevJitter; // previous traced image uses the jittered projection
 uniform vec2 u_rtSize;
 uniform vec2 u_rtParams;	// x: reflections available, y: strength
 uniform sampler2D u_shadowPrev;	// last frame's traced sun shadows (softened, same size)
 uniform vec2 u_shadowParams;	// x: shadows available, y: strength
+vec3 glassDir = vec3(0.0);
+float glassWeight = 0.0;
 layout(location = 2) out vec4 reflOut;
 float wetWeight = 0.0;
 
@@ -99,20 +112,24 @@ void DoWet(inout vec4 color)
 	float surface = up;
 	float wetAmount = v_rw*surface;
 	groundMark = up > 0.5 ? 1.0 : 0.0;
-	// Level ground takes the traced sun shadow here, in its own shader, from last frame's image (exact for static ground).
-	// Shadow and puddle then combine inside one shader instead of two screen passes fighting over the same pixels: the
-	// shadow darkens the ground, the puddle mirror is mixed over it afterwards and is not darkened.
-	bool shadowOn = mod(u_shadowParams.x, 2.0) > 0.5, coverOn = u_shadowParams.x > 1.5;
-	if(groundMark > 0.5 && shadowOn && v_posPrev.w > 0.0){
-		vec2 spu = (v_posPrev.xy/v_posPrev.w)*0.5 + 0.5;
-		if(spu.x > 0.0 && spu.x < 1.0 && spu.y > 0.0 && spu.y < 1.0){
-			float sh = texture(u_shadowPrev, spu).r;
-			color.rgb *= 1.0 - clamp(sh*u_shadowParams.y, 0.0, 1.0);
-		}
+	// Sun shadows are composited from the current trace after geometry is complete. Sampling last frame here
+	// turned pixels previously covered by a character/car into bright, unshadowed cutouts on the ground.
+	bool coverOn = u_shadowParams.x > 1.5;
+	glassWeight = 0.0;
+	if(u_glassRefl.x > 0.001){
+		// glass and windows: a mirror direction from the face normal; the traced colour of last frame is mixed in below
+		vec3 viewDir = normalize(v_rrel);
+		vec3 gn = dot(faceN, viewDir) > 0.0 ? -faceN : faceN;
+		float cosT = clamp(-dot(viewDir, gn), 0.0, 1.0);
+		float fres = 0.04 + 0.96*pow(1.0 - cosT, 5.0);
+		glassDir = reflect(viewDir, gn);
+		glassWeight = u_glassRefl.x*mix(0.3, 1.0, fres)*(u_glassRefl.z > 0.5 ? 1.0 : 1.0 - smoothstep(0.75, 0.95, abs(gn.z)));
+		// The current-frame trace is composited after opaque and transparent geometry.
+
 	}
 	if(wetAmount > 0.001 && coverOn && v_posPrev.w > 0.0){
 		// ground under a roof (traced last frame, the map does not move) stays dry
-		vec2 cpu = (v_posPrev.xy/v_posPrev.w)*0.5 + 0.5;
+		vec2 cpu = (v_posPrev.xy/v_posPrev.w)*0.5 + 0.5 + u_rtPrevJitter;
 		if(cpu.x > 0.0 && cpu.x < 1.0 && cpu.y > 0.0 && cpu.y < 1.0)
 			wetAmount *= 1.0 - smoothstep(0.3, 0.8, texture(u_shadowPrev, cpu).b);
 	}
@@ -121,16 +138,8 @@ void DoWet(inout vec4 color)
 		float puddle = smoothstep(0.56, 0.72, n)*smoothstep(0.25, 0.6, clamp(wetAmount*1.4, 0.0, 1.0))*u_roadPuddles;
 		wetWeight = wetAmount*mix(0.12, 0.9, v_rfres)*0.5 + puddle*0.95;
 		color.rgb *= 1.0 - 0.15*puddle;
-		// the reflection belongs to the ground itself: look it up where this point was last frame (the ground is static, so
-		// that is exact) and mix it into the ground colour. Characters and cars drawn later simply cover it.
-		if(u_rtParams.x > 0.5 && v_posPrev.w > 0.0){
-			vec2 pu = (v_posPrev.xy/v_posPrev.w)*0.5 + 0.5;
-			if(pu.x > 0.0 && pu.x < 1.0 && pu.y > 0.0 && pu.y < 1.0){
-				vec4 r = texture(u_rtPrev, pu);
-				// the filtered image holds colour*coverage in rgb and coverage in a: undo that so edges fade instead of flicker
-				color.rgb = mix(color.rgb, r.rgb/max(r.a, 0.001), clamp(wetWeight*u_rtParams.y, 0.0, 1.0)*smoothstep(0.0, 0.6, r.a));
-			}
-		}
+		// Current-frame compositing prevents old vehicle silhouettes entering wet-road colour.
+
 	}
 }
 // The neo road gloss used to be a second additive pass over every road. Doing it in the same draw halves the road draw calls.
@@ -144,7 +153,7 @@ void DoGloss(inout vec4 color, vec2 uv, float fog)
 }
 #define WET_FS(color) DoWet(color)
 #define GLOSS_FS(color) DoGloss(color, v_tex0, v_fog)
-#define WRITE_REFL() (reflOut = vec4(normalize(v_rrefl)*0.5 + 0.5, clamp(wetWeight, 0.0, 1.0)))	// 8 bit: direction*0.5+0.5, weight
+#define WRITE_REFL() (reflOut = glassWeight > wetWeight ? vec4(normalize(glassDir)*0.5 + 0.5, clamp(glassWeight, 0.0, 1.0)) : vec4(normalize(v_rrefl)*0.5 + 0.5, clamp(wetWeight, 0.0, 1.0)))	// half-float direction*0.5+0.5, weight
 #elif defined(ZERO_REFL)
 // shaders of things that are not wet ground (characters, other materials) clear the reflection weight under them
 layout(location = 2) out vec4 reflOut;

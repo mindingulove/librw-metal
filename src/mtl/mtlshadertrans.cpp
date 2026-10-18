@@ -50,7 +50,7 @@ preprocess(EShLanguage stage, const std::string &src, std::string &out, std::str
 	return true;
 }
 
-static void fixRectCalls(std::string &src);
+static void fixRectCalls(std::string &src, const std::vector<std::string> &rectNames);
 
 struct StageText {
 	std::string head;		// #version / #extension lines
@@ -80,7 +80,7 @@ transformStage(const std::string &pre, bool isVertex, std::map<std::string, int>
 		if(!st.rectNames.empty()){
 			size_t p = 0;
 			while((p = fixedPre.find("sampler2DRect", p)) != std::string::npos){ fixedPre.replace(p, 13, "sampler2D"); }
-			fixRectCalls(fixedPre);
+			fixRectCalls(fixedPre, st.rectNames);
 		}
 	}
 	std::istringstream in(fixedPre);
@@ -140,11 +140,39 @@ transformStage(const std::string &pre, bool isVertex, std::map<std::string, int>
 	st.body = body;
 }
 
-// Rectangle textures are plain 2D textures in Metal. The engine only reads them with texelFetch(sampler, ivec2) and
-// textureSize(sampler): give those calls the level argument that sampler2D wants.
+// Rectangle textures are plain 2D textures in Metal. Integer reads need an explicit mip level;
+// filtered reads also need their pixel coordinates normalized to the texture dimensions.
 static void
-fixRectCalls(std::string &src)
+fixRectCalls(std::string &src, const std::vector<std::string> &rectNames)
 {
+	// Filtered sampler2DRect reads use texel coordinates, unlike sampler2D. Only rewrite
+	// known rectangle samplers: ordinary normalized 2D reads in the same shader stay intact.
+	size_t pos = 0;
+	while((pos = src.find("texture(", pos)) != std::string::npos){
+		if(pos > 0 && (isalnum((unsigned char)src[pos-1]) || src[pos-1]=='_')){ pos += 8; continue; }
+		size_t open=pos+7, comma=std::string::npos, close=std::string::npos;
+		int depth=0, commas=0;
+		for(size_t i=open;i<src.size();i++){
+			if(src[i]=='(') depth++;
+			else if(src[i]==')'){if(--depth==0){close=i;break;}}
+			else if(src[i]==',' && depth==1){if(commas++==0) comma=i;}
+		}
+		if(close==std::string::npos) break;
+		if(commas==1){
+			std::string sampler=src.substr(open+1,comma-open-1);
+			size_t first=sampler.find_first_not_of(" \t\r\n"),last=sampler.find_last_not_of(" \t\r\n");
+			if(first!=std::string::npos) sampler=sampler.substr(first,last-first+1);
+			bool rectangle=false;
+			for(const auto &name:rectNames) if(name==sampler){rectangle=true;break;}
+			if(rectangle){
+				std::string coord=src.substr(comma+1,close-comma-1);
+				std::string normalized=" ("+coord+")/vec2(textureSize("+sampler+", 0))";
+				src.replace(comma+1,close-comma-1,normalized);
+				close=comma+1+normalized.size();
+			}
+		}
+		pos=close+1;
+	}
 	for(const char *fn : { "texelFetch", "textureSize" }){
 		size_t want = strcmp(fn, "texelFetch") == 0 ? 1 : 0;	// texelFetch: add the level when there are 2 arguments; textureSize: when 1
 		size_t pos = 0;
@@ -261,7 +289,8 @@ toMsl(std::vector<unsigned> &spirv, bool isVertex, StageText &st, int stageIdx, 
 	auto res = c.get_shader_resources();
 	for(auto &ub : res.uniform_buffers){
 		auto &type = c.get_type(ub.base_type_id);
-		blockSize = (int)c.get_declared_struct_size(type);
+		// Metal rounds constant-buffer structs to their 16-byte aggregate alignment.
+		blockSize = ((int)c.get_declared_struct_size(type) + 15) & ~15;
 		for(uint32_t i = 0; i < type.member_types.size(); i++){
 			TransUniform u;
 			u.name = c.get_member_name(ub.base_type_id, i);

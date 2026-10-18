@@ -70,6 +70,8 @@ enum AttribIndices
 
 // default uniform indices
 extern int32 u_matColor;
+extern int32 u_glassRefl;
+bool32 setGlassForTexture(Texture *tex);
 extern int32 u_surfProps;
 
 struct InstanceData
@@ -86,6 +88,7 @@ struct InstanceData
 struct InstanceDataHeader;
 // ray traced reflections: registers an atomic that is being drawn (see gl3device.cpp)
 void rtCollect(Atomic *atomic, InstanceDataHeader *header);
+void getSkinMatrices(Atomic *atomic, float *out);
 
 struct InstanceDataHeader : rw::InstanceDataHeader
 {

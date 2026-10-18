@@ -1,3 +1,5 @@
+#include "../matrixinvert.h"
+#include "../skinpositions.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -159,6 +161,7 @@ int32 u_lightColor;
 #endif
 
 int32 u_matColor;
+int32 u_glassRefl;	// x: ray traced reflection strength of this material (glass and windows)
 int32 u_surfProps;
 
 Shader *defaultShader, *defaultShader_noAT;
@@ -281,12 +284,26 @@ static int gVelWant = 1, gVelBoth = 1;	// draw buffers the selected shader wants
 static float gRTStrength = 0.85f, gRTDistance = 250.0f;
 static bool gRT = false;
 static bool gRTShadows = false;			// RenderRTShadows=1: sun shadows traced from the same scene
-static int gRTDiv = 2;				// ray tracing resolution divisor (2 = half resolution, RenderRTHalfRes=0 for full)		// re3.ini [Graphics] RenderRT=1: ray traced reflections on vehicles (Metal ray tracing)
+// Trace each scene pixel independently: a shared 2x2 ray loses thin reflected features
+// and produces coarse transitions even when the final image is bilinearly sampled.
+// RenderRTHalfRes=1 remains an explicit performance option.
+static int gRTDiv = 1;
+static int gSceneMSAA = 4; // native Metal geometry samples, before RT and MetalFX (default 4x)
 static bool gNeedVel = false;		// motion vector attachment needed (temporal upscaling or ray tracing)
 static int gVelObj, gSceneSerial;
 static float gVelPrevWorld[16];
 static float gVelOn;
 static bool gRTRoadsOn = true;
+static bool gAO = true;			// re3.ini [Graphics] RenderRTAO: ray traced ambient occlusion for the whole world
+static float gAOStrength = 0.6f;	// RenderRTAOStrength
+static bool gGI = true;			// RenderRTGI: one bounce of indirect light
+static float gGIStrength = 0.5f;	// RenderRTGIStrength
+static bool gRTLights = true;		// RenderRTLights: street/vehicle lights light the world, with traced shadows
+static float gRTLightStrength = 0.8f;	// RenderRTLightStrength
+// filled by the game every frame: point lights (8 floats each: position, radius, colour, intensity); returns the count
+extern "C" int regtaRTGatherLights(float *out, int maxLights);
+extern "C" void regtaRTCollectVehicles(const float *eye, float distance);
+extern "C" void mrtSetLights(const float *data, int count);
 static bool gCoverNow;			// the traced image also says which ground is under a roof (b channel: no puddles there)
 static float gShadowStrengthNow;			// strength of the traced shadow now (0 when off), set by the ray tracing pass
 static GLuint gShadowOutTex;			// last traced shadow image
@@ -296,16 +313,23 @@ static float gRoadWet, gVelRoadWet, gRTRoadStrength = 0.7f;
 // which ray traced effects are wanted right now: car reflections, shadows and wet road reflections work on their own
 static inline bool rtWetRoads(void){ return gRTRoadsOn && gRoadWet > 0.05f; }
 static inline bool rtWantsRefl(void){ return gRT || rtWetRoads(); }
-static inline bool rtActive(void){ return gRT || gRTShadows || rtWetRoads(); }	// wetness of the roads (0..1), value for the object being drawn
-extern "C" { int regtaVelocityDynamic; int regtaRoadDraw; }	// set by the game while it draws a moving object / a road
+extern "C" int8_t regtaGfxSunShafts;
+static inline bool rtActive(void){ return gRT || gRTShadows || rtWetRoads() || regtaGfxSunShafts > 0; }	// wetness of the roads (0..1), value for the object being drawn
+extern "C" { int regtaVelocityDynamic; int regtaRTStaticObject; int regtaRTVehicle; void *regtaRTVehicleClump; int regtaRoadDraw; }	// set by the game while it draws a moving object / a road
 extern "C" void regtaRTSetWetness(float wet) { gRoadWet = wet; }	// set by the game while it draws a moving object
-struct VelEntry { float cur[16], prev[16]; int frame; };
+struct VelEntry { float cur[16]{}, prev[16]{}; int frame=-100; int actor=0; };
+static int gNextActorID=1;
+static float gVelActorID=0;
 static std::unordered_map<const void*, VelEntry> gVelMap;
 // Graphics options the game's menu changes while running (the menu stores them in re3.ini [Graphics] under the same keys).
 // Index into kScaleTable for the render scale (restart needed for that one).
-extern "C" { int8_t regtaGfxScaleIdx, regtaGfxTemporal, regtaGfxMetalFX, regtaGfxSSR, regtaGfxRT, regtaGfxRTRoads, regtaGfxRTShadows, regtaGfxPuddles = 1; }
+extern "C" { int8_t regtaGfxRTResolutionIdx=0, regtaGfxMSAAIdx=2, regtaGfxScaleIdx, regtaGfxTemporal, regtaGfxMetalFX, regtaGfxSSR, regtaGfxRT, regtaGfxRTRoads, regtaGfxRTShadows, regtaGfxPuddles = 1, regtaGfxRTAO = 1, regtaGfxRTGI = 1, regtaGfxRTLights = 1, regtaGfxRTGlass = 1, regtaGfxSunShafts = 1; }
 static const float kScaleTable[6] = { 1.0f, 0.9f, 0.8f, 0.75f, 0.67f, 0.5f };
 // frame cost of the extra graphics passes (milliseconds, smoothed): ray tracing, MetalFX, whole upscale/resolve step
+#ifdef RW_METALGL
+extern "C" float mrtGpuMilliseconds(void);
+extern "C" float mfxGpuMilliseconds(void);
+#endif
 static float gPerfMs[6];	// ray tracing, MetalFX, upscale step, scene feed, scene CPU, scene GPU
 static GLuint gSceneQuery[2];
 static int gSceneQi;
@@ -314,7 +338,32 @@ static double gSceneFrameStart;
 // timer queries are optional in the GL loader: only use them when every entry point exists
 static inline bool sceneQueriesUsable(void){ return glGenQueries && glBeginQuery && glEndQuery && glGetQueryObjectuiv && glGetQueryObjectui64v; }
 static double gCollectAcc;	// time spent registering geometry with the ray tracer this frame
+// The same renderer runs GTA III (re3.ini) and Vice City (reVC.ini): read whichever settings file the game folder has.
+static const char *
+gameIniName(void)
+{
+	static const char *name = nullptr;
+	if(!name){
+		FILE *f = fopen("reVC.ini", "r");
+		if(f){ fclose(f); name = "reVC.ini"; } else name = "re3.ini";
+	}
+	return name;
+}
 static inline double perfNow(void){ return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+extern "C" int regtaMSAASupported(int samples){
+#ifdef RW_METALGL
+ return mtlglSupportsSamples(samples);
+#else
+ return samples==1;
+#endif
+}
+extern "C" int regtaSceneSamples(void){
+#ifdef RW_METALGL
+ return mtlglSceneMSAASamples(rsFbo);
+#else
+ return 1;
+#endif
+}
 extern "C" void regtaPerfGet(float *ms){ ms[0] = gPerfMs[0]; ms[1] = gPerfMs[1]; ms[2] = gPerfMs[2]; ms[3] = gPerfMs[3]; ms[4] = gPerfMs[4]; ms[5] = gPerfMs[5];
 #ifdef RW_METALGL
 	ms[5] = mtlglGpuMs();
@@ -326,8 +375,10 @@ static bool gMetalFX = false;		// re3.ini [Graphics] RenderMetalFX=1: MetalFX te
 static float gMfxJitterSignX = 1.0f, gMfxJitterSignY = 1.0f;
 static bool gSSR = false;		// vehicles may sample a copy of the scene (screen space reflections)
 static bool gUseTarget = false;		// 3D scene goes through the offscreen target (render scale < 1 or temporal)
+static float gCurRTJitter[2], gPrevRTJitter[2]; // normalized offsets of the traced images
 static float gJit[2];			// current jitter in target pixels
 static int gFrameIdx;
+extern "C" int regtaRenderFrameIndex(void){return gFrameIdx;}
 static bool gJitterApplied;		// the main camera was jittered this frame
 static bool gHistValid;
 static float gCurVP[16], gPrevVP[16], gInvVP[16], gInvVPJit[16];	// gInvVPJit: inverse of the jittered matrix the depth buffer was really rendered with
@@ -337,8 +388,8 @@ mat4mul(float *r, const float *a, const float *b)	// column-major r = a*b
 {
 	for(int c = 0; c < 4; c++)
 		for(int rw = 0; rw < 4; rw++){
-			float v = 0;
-			for(int k = 0; k < 4; k++) v += a[k*4+rw]*b[c*4+k];
+			double v = 0;
+			for(int k = 0; k < 4; k++) v += double(a[k*4+rw])*b[c*4+k];
 			r[c*4+rw] = v;
 		}
 }
@@ -346,28 +397,7 @@ mat4mul(float *r, const float *a, const float *b)	// column-major r = a*b
 static bool
 mat4inv(float *out, const float *m)
 {
-	float inv[16];
-	inv[0] = m[5]*m[10]*m[15]-m[5]*m[11]*m[14]-m[9]*m[6]*m[15]+m[9]*m[7]*m[14]+m[13]*m[6]*m[11]-m[13]*m[7]*m[10];
-	inv[4] = -m[4]*m[10]*m[15]+m[4]*m[11]*m[14]+m[8]*m[6]*m[15]-m[8]*m[7]*m[14]-m[12]*m[6]*m[11]+m[12]*m[7]*m[10];
-	inv[8] = m[4]*m[9]*m[15]-m[4]*m[11]*m[13]-m[8]*m[5]*m[15]+m[8]*m[7]*m[13]+m[12]*m[5]*m[11]-m[12]*m[7]*m[9];
-	inv[12] = -m[4]*m[9]*m[14]+m[4]*m[10]*m[13]+m[8]*m[5]*m[14]-m[8]*m[6]*m[13]-m[12]*m[5]*m[10]+m[12]*m[6]*m[9];
-	inv[1] = -m[1]*m[10]*m[15]+m[1]*m[11]*m[14]+m[9]*m[2]*m[15]-m[9]*m[3]*m[14]-m[13]*m[2]*m[11]+m[13]*m[3]*m[10];
-	inv[5] = m[0]*m[10]*m[15]-m[0]*m[11]*m[14]-m[8]*m[2]*m[15]+m[8]*m[3]*m[14]+m[12]*m[2]*m[11]-m[12]*m[3]*m[10];
-	inv[9] = -m[0]*m[9]*m[15]+m[0]*m[11]*m[13]+m[8]*m[1]*m[15]-m[8]*m[3]*m[13]-m[12]*m[1]*m[11]+m[12]*m[3]*m[9];
-	inv[13] = m[0]*m[9]*m[14]-m[0]*m[10]*m[13]-m[8]*m[1]*m[14]+m[8]*m[2]*m[13]+m[12]*m[1]*m[10]-m[12]*m[2]*m[9];
-	inv[2] = m[1]*m[6]*m[15]-m[1]*m[7]*m[14]-m[5]*m[2]*m[15]+m[5]*m[3]*m[14]+m[13]*m[2]*m[7]-m[13]*m[3]*m[6];
-	inv[6] = -m[0]*m[6]*m[15]+m[0]*m[7]*m[14]+m[4]*m[2]*m[15]-m[4]*m[3]*m[14]-m[12]*m[2]*m[7]+m[12]*m[3]*m[6];
-	inv[10] = m[0]*m[5]*m[15]-m[0]*m[7]*m[13]-m[4]*m[1]*m[15]+m[4]*m[3]*m[13]+m[12]*m[1]*m[7]-m[12]*m[3]*m[5];
-	inv[14] = -m[0]*m[5]*m[14]+m[0]*m[6]*m[13]+m[4]*m[1]*m[14]-m[4]*m[2]*m[13]-m[12]*m[1]*m[6]+m[12]*m[2]*m[5];
-	inv[3] = -m[1]*m[6]*m[11]+m[1]*m[7]*m[10]+m[5]*m[2]*m[11]-m[5]*m[3]*m[10]-m[9]*m[2]*m[7]+m[9]*m[3]*m[6];
-	inv[7] = m[0]*m[6]*m[11]-m[0]*m[7]*m[10]-m[4]*m[2]*m[11]+m[4]*m[3]*m[10]+m[8]*m[2]*m[7]-m[8]*m[3]*m[6];
-	inv[11] = -m[0]*m[5]*m[11]+m[0]*m[7]*m[9]+m[4]*m[1]*m[11]-m[4]*m[3]*m[9]-m[8]*m[1]*m[7]+m[8]*m[3]*m[5];
-	inv[15] = m[0]*m[5]*m[10]-m[0]*m[6]*m[9]-m[4]*m[1]*m[10]+m[4]*m[2]*m[9]+m[8]*m[1]*m[6]-m[8]*m[2]*m[5];
-	float det = m[0]*inv[0] + m[1]*inv[4] + m[2]*inv[8] + m[3]*inv[12];
-	if(det == 0.0f) return false;
-	det = 1.0f/det;
-	for(int i = 0; i < 16; i++) out[i] = inv[i]*det;
-	return true;
+	return matrixutil::invert4(out,m);
 }
 
 static float
@@ -385,10 +415,9 @@ applyVelBuffers(void)
 {
 	if(!rsVelTex || currentFramebuffer != rsFbo) return;
 	int want = gVelWant;
-	// reflection marks are only written when somebody reads them: cars need them for ray traced reflections, ground and the
-	// shaders that clear marks only while the ground is wet
+	// Active ray tracing needs window marks in dry weather too, and nonreflective draws must clear stale marks.
 	if(want > 2){
-		bool needed = gVelKind == 0 ? gRT : rtWetRoads();
+		bool needed = gRT || rtWetRoads(); // dry-weather windows also emit rays; other draws clear stale reflection marks
 		if(!needed || !rsReflTex) want = 2;
 	}
 	if(want == 2 && !gTemporal) want = 1;		// motion vectors only matter for the temporal upscaler
@@ -829,6 +858,39 @@ evictRaster(Raster *raster)
 	}
 }
 
+// Glass, windows and mirrors get ray traced reflections. The map has no material data for that: go by the texture name.
+static bool gRTGlass = true;		// re3.ini [Graphics] RenderRTGlass
+static float gRTGlassStrength = 0.5f;	// RenderRTGlassStrength
+extern "C" int8_t regtaGfxRTGlass;
+extern "C" int regtaRTVehicleOwner(void *clump);
+extern "C" int regtaRTReflectionsActive(void);
+extern "C" float regtaVehicleGlassStrength(void){return gRTGlass && regtaGfxRTGlass ? std::max(0.f,std::min(2.f,2.f*gRTGlassStrength)) : 0.f;}
+bool32
+setGlassForTexture(Texture *tex)
+{
+	struct Entry { char name[32]; float v; };
+	static std::unordered_map<Texture*, Entry> cache;
+	float v = 0.0f;
+	if(tex && gRTGlass && regtaGfxRTGlass){
+		auto it = cache.find(tex);
+		if(it != cache.end() && strncmp(it->second.name, tex->name, 32) == 0)
+			v = it->second.v;
+		else{
+			char low[32];
+			int i = 0;
+			for(; i < 31 && tex->name[i]; i++) low[i] = (char)tolower((unsigned char)tex->name[i]);
+			low[i] = 0;
+			bool glass = strstr(low, "glass") || strstr(low, "window") || strstr(low, "wndw") || strstr(low, "mirror");
+			v = glass ? 1.0f : 0.0f;
+			Entry e; strncpy(e.name, tex->name, 32); e.v = v;
+			cache[tex] = e;
+		}
+	}
+	float g[4] = { v*gRTGlassStrength, (float)regtaRTVehicleOwner(regtaRTVehicleClump), regtaRTVehicle ? 1.f : 0.f, 0.0f };
+	setUniform(u_glassRefl, g);
+	return regtaRTReflectionsActive() && v > 0.0f;
+}
+
 void
 setTexture(int32 stage, Texture *tex)
 {
@@ -1151,8 +1213,13 @@ setWorldMatrix(Matrix *mat)
 	// everything static can get wet: the shader picks the upward facing grey surfaces (roads, pavements)
 	gVelRoadWet = (!regtaVelocityDynamic && gRTRoadsOn) ? gRoadWet*gRTRoadStrength : 0.0f;
 	if((gTemporal || gRT) && gUseTarget && regtaVelocityDynamic){
-		if(gVelMap.size() > 30000) gVelMap.clear();
+		if(gVelMap.size() > 30000){gVelMap.clear();gNextActorID=1;gHistValid=false;}
 		VelEntry &e = gVelMap[mat];
+		if(!e.actor && !regtaRTVehicle){
+			if(gNextActorID<2048)e.actor=gNextActorID++;
+			else for(auto &old:gVelMap)if(old.second.actor && old.second.frame<gFrameIdx-2){e.actor=old.second.actor;old.second.actor=0;break;}
+		}
+		gVelActorID=(float)e.actor;
 		float *w = (float*)&uniformObject.world;
 		if(e.frame != gFrameIdx){
 			if(e.frame == gFrameIdx-1) memcpy(e.prev, e.cur, sizeof(e.prev));
@@ -1164,7 +1231,7 @@ setWorldMatrix(Matrix *mat)
 		gVelOn = 1.0f;
 	}else{
 		memcpy(gVelPrevWorld, &uniformObject.world, sizeof(gVelPrevWorld));
-		gVelOn = 0.0f;
+		gVelOn = 0.0f;gVelActorID=0;
 	}
 }
 
@@ -1184,6 +1251,7 @@ uploadVelocityUniforms(Shader *s)
 		s->velLoc[1] = glGetUniformLocation(s->program, "u_vpPrev");
 		s->velLoc[2] = glGetUniformLocation(s->program, "u_prevWorld");
 		s->velLoc[3] = glGetUniformLocation(s->program, "u_velOn");
+		s->actorLoc = glGetUniformLocation(s->program,"u_actorId");
 		s->roadLoc = glGetUniformLocation(s->program, "u_roadWet");
 		s->puddleLoc = glGetUniformLocation(s->program, "u_roadPuddles");
 		s->rtLoc[0] = glGetUniformLocation(s->program, "u_rtPrev");
@@ -1191,13 +1259,16 @@ uploadVelocityUniforms(Shader *s)
 		s->rtLoc[2] = glGetUniformLocation(s->program, "u_rtParams");
 		s->rtLoc[3] = glGetUniformLocation(s->program, "u_shadowPrev");
 		s->rtLoc[4] = glGetUniformLocation(s->program, "u_shadowParams");
+		s->rtLoc[5] = glGetUniformLocation(s->program, "u_rtPrevJitter");
 	}
 	if(s->velFrame != gFrameIdx || s->velScene != gSceneSerial){
 		if(s->velLoc[0] >= 0) glUniformMatrix4fv(s->velLoc[0], 1, GL_FALSE, gCurVP);
 		if(s->velLoc[1] >= 0) glUniformMatrix4fv(s->velLoc[1], 1, GL_FALSE, gPrevVP);
+		if(s->rtLoc[5] >= 0) glUniform2f(s->rtLoc[5], gPrevRTJitter[0], gPrevRTJitter[1]);
 		if(s->rtLoc[0] >= 0) glUniform1i(s->rtLoc[0], 4);
 		if(s->rtLoc[1] >= 0) glUniform2f(s->rtLoc[1], (float)gRTOutW, (float)gRTOutH);
-		if(s->rtLoc[2] >= 0) glUniform2f(s->rtLoc[2], (gRTOutTex && rtWantsRefl() && gRoadWet > 0.05f) ? 1.0f : 0.0f, gRTStrength);
+		// x: last frame's traced reflections are there to read (wet ground and glass decide themselves whether they need them)
+		if(s->rtLoc[2] >= 0) glUniform2f(s->rtLoc[2], gRTOutTex ? 1.0f : 0.0f, gRTStrength);
 		if(s->rtLoc[3] >= 0) glUniform1i(s->rtLoc[3], 5);
 		// x: 1 = sun shadows available, + 2 = roof test available
 		if(s->rtLoc[4] >= 0) glUniform2f(s->rtLoc[4], (gShadowOutTex && gShadowStrengthNow > 0.001f ? 1.0f : 0.0f) + (gShadowOutTex && gCoverNow ? 2.0f : 0.0f), gShadowStrengthNow);
@@ -1207,6 +1278,7 @@ uploadVelocityUniforms(Shader *s)
 	if(s->velObj != gVelObj){
 		if(s->velLoc[2] >= 0) glUniformMatrix4fv(s->velLoc[2], 1, GL_FALSE, gVelPrevWorld);
 		if(s->velLoc[3] >= 0) glUniform1f(s->velLoc[3], gVelOn);
+		if(s->actorLoc>=0)glUniform1f(s->actorLoc,gVelActorID);
 		if(s->roadLoc >= 0) glUniform1f(s->roadLoc, gVelRoadWet);
 		if(s->puddleLoc >= 0) glUniform1f(s->puddleLoc, regtaGfxPuddles ? 1.0f : 0.0f);
 		s->velObj = gVelObj;
@@ -1455,7 +1527,8 @@ rsEnsureTargets(Raster *fbuf)
 	if(gNeedVel){
 		if(rsVelTex == 0) glGenTextures(1, &rsVelTex);
 		glBindTexture(GL_TEXTURE_2D, rsVelTex);
-		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, w, h, 0, GL_RGBA, GL_HALF_FLOAT, nil);
+		// Float32 retains window receiver depth near the far plane and exact vehicle ownership.
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, w, h, 0, GL_RGBA, GL_FLOAT, nil);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -1465,7 +1538,7 @@ rsEnsureTargets(Raster *fbuf)
 		if(gNeedVel){
 			if(rsReflTex == 0) glGenTextures(1, &rsReflTex);
 			glBindTexture(GL_TEXTURE_2D, rsReflTex);
-			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nil);	// 8 bits per channel instead of 16: half the memory traffic
+			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, w, h, 0, GL_RGBA, GL_HALF_FLOAT, nil);	// fine ray direction changes must not jump between 8-bit bins
 			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -1551,6 +1624,9 @@ setFrameBuffer(Camera *cam)
 			glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, 0, 0);
 		natfb->fboMate = nil;
 	}
+#ifdef RW_METALGL
+	if(gScaledFrame && natfb->fbo==rsFbo) mtlglBeginSceneMSAA(rsFbo,gSceneMSAA);
+#endif
 }
 
 static float
@@ -1785,7 +1861,9 @@ static const char *rsRcasSrc =
 "	float lobe = max(-0.1875, min(max(lobeRGB.r, max(lobeRGB.g, lobeRGB.b)), 0.0)) * exp2(-sharp);\n"
 "	lobe *= nz;\n"
 "	float rcpL = 1.0/(4.0*lobe + 1.0);\n"
-"	fragColor = vec4((lobe*(b+d+f+h) + e)*rcpL, 1.0);\n"
+"	// Prevent sharpening from creating a bright/dark outline beyond the neighbouring source colours.\n"
+"	vec3 sharpened = (lobe*(b+d+f+h) + e)*rcpL;\n"
+"	fragColor = vec4(clamp(sharpened, min(mn4,e), max(mx4,e)), 1.0);\n"
 "}\n";
 
 
@@ -1844,7 +1922,7 @@ static const char *rsTemporalSrc =
 "	vec4 vel = texelFetch(velTex, clamp(dTex, ivec2(0), ivec2(lowSize)-1), 0);\n"
 "	vec2 puv;\n"
 "	bool ok;\n"
-"	if(vel.a > 0.5){\n"
+"	if((vel.a > 0.5 || vel.a < 0.0)){\n"
 "		// moving object: its own motion vector\n"
 "		puv = outUV - vel.xy;\n"
 "		ok = histValid > 0.5;\n"
@@ -1909,12 +1987,34 @@ int mfxRun(float jitterX, float jitterY, int reset);
 void mfxShutdown(void);
 }
 
+static const char *rsMfxMaskSrc =
+"#version 330\n"
+"uniform sampler2D velTex;\n"
+"uniform sampler2D depthTex;\n"
+"uniform sampler2D colorTex;\n"
+"uniform sampler2D dynShadow;\n"
+"uniform vec2 lowSize;\n"
+"out vec4 fragColor;\n"
+"void main(){\n"
+" ivec2 p=ivec2(gl_FragCoord.xy);\n"
+" vec4 velocity=texelFetch(velTex,p,0);\n"
+" float actor=(velocity.a>0.5 || velocity.a<0.0) ? velocity.b:0.0;\n"
+" float shadow=texture(dynShadow,gl_FragCoord.xy/lowSize).g;\n"
+" float luma=dot(texelFetch(colorTex,p,0).rgb,vec3(0.299,0.587,0.114));\n"
+" fragColor=vec4(shadow,texelFetch(depthTex,p,0).r,actor,luma);\n"
+"}\n"
+;
+
 static const char *rsMfxPrepSrc =
 "#version 330\n"
 "uniform sampler2D colorTex;\n"
 "uniform sampler2D depthTex;\n"
 "uniform sampler2D velTex;\n"
-"uniform sampler2D dynShadow;\n"
+"uniform sampler2D dynamicMask;\n"
+"uniform sampler2D prevDynamicMask;\n"
+"uniform vec2 prevJitterUV;\n"
+"uniform float maskHistoryValid;\n"
+"uniform vec2 jitterUV;\n"
 "uniform vec2 lowSize;\n"
 "uniform mat4 invVP;\n"
 "uniform mat4 prevVP;\n"
@@ -1922,6 +2022,25 @@ static const char *rsMfxPrepSrc =
 "layout(location = 1) out vec4 oDepth;\n"
 "layout(location = 2) out vec4 oMotion;\n"
 "layout(location = 3) out vec4 oReactive;\n"
+"// Spatial AA for reactive pixels that deliberately reject temporal history.\n"
+"vec3 reactiveAA(vec2 uv, vec3 center){\n"
+"    vec2 px=1.0/lowSize;\n"
+"    vec3 nw=texture(colorTex,uv+vec2(-1,1)*px).rgb;\n"
+"    vec3 ne=texture(colorTex,uv+vec2(1,1)*px).rgb;\n"
+"    vec3 sw=texture(colorTex,uv+vec2(-1,-1)*px).rgb;\n"
+"    vec3 se=texture(colorTex,uv+vec2(1,-1)*px).rgb;\n"
+"    vec3 luma=vec3(0.299,0.587,0.114);\n"
+"    float c=dot(center,luma),a=dot(nw,luma),b=dot(ne,luma),d=dot(sw,luma),e=dot(se,luma);\n"
+"    float lo=min(c,min(min(a,b),min(d,e))),hi=max(c,max(max(a,b),max(d,e)));\n"
+"    if(hi-lo<max(0.0312,hi*0.125)) return center;\n"
+"    vec2 direction=vec2(-(a+b-d-e),a+d-b-e);\n"
+"    float reduction=max((a+b+d+e)*0.03125,0.0078125);\n"
+"    direction=clamp(direction/(min(abs(direction.x),abs(direction.y))+reduction),vec2(-4),vec2(4))*px;\n"
+"    vec3 narrow=0.5*(texture(colorTex,uv-direction/6.0).rgb+texture(colorTex,uv+direction/6.0).rgb);\n"
+"    vec3 wide=narrow*0.5+0.25*(texture(colorTex,uv-direction*0.5).rgb+texture(colorTex,uv+direction*0.5).rgb);\n"
+"    float l=dot(wide,luma);\n"
+"    return clamp(l<lo || l>hi ? narrow:wide,min(min(nw,ne),min(min(sw,se),center)),max(max(nw,ne),max(max(sw,se),center)));\n"
+"}\n"
 "void main(){\n"
 "	ivec2 p = ivec2(gl_FragCoord.xy);\n"
 "	oColor = vec4(texelFetch(colorTex, p, 0).rgb, 1.0);\n"
@@ -1930,21 +2049,40 @@ static const char *rsMfxPrepSrc =
 "	vec2 uv = gl_FragCoord.xy/lowSize;\n"
 "	vec4 vel = texelFetch(velTex, p, 0);\n"
 "	vec2 v;\n"
-"	if(vel.a > 0.5){\n"
+"	if((vel.a > 0.5 || vel.a < 0.0)){\n"
 "		v = vel.xy;\n"
 "	}else{\n"
 "		vec4 wp = invVP*vec4(uv*2.0-1.0, d*2.0-1.0, 1.0);\n"
 "		vec4 pc = prevVP*vec4(wp.xyz/wp.w, 1.0);\n"
-"		v = uv - (pc.xy/pc.w*0.5 + 0.5);\n"
+"		v = uv - jitterUV - (pc.xy/pc.w*0.5 + 0.5);\n"
 "	}\n"
 "	// MetalFX: pixels from the current position to the previous one (rows run the other way in the shared memory)\n"
 "	oMotion = vec4(-v.x*lowSize.x, -v.y*lowSize.y, 0.0, 1.0);\n"
-"	// characters (velocity alpha 2): their skinning motion is not in the vectors, so the scaler must not trust history there\n"
-"	// moving shadows (cars, props) smear in a temporal upscaler: their pixels and a margin around them follow the current frame\n"
-"	vec2 uv0 = gl_FragCoord.xy/lowSize;\n"
-"	vec2 o = vec2(6.0)/lowSize;\n"
-"	float dyn = max(max(texture(dynShadow, uv0).g, texture(dynShadow, uv0 + vec2(o.x, 0.0)).g), max(texture(dynShadow, uv0 - vec2(o.x, 0.0)).g, max(texture(dynShadow, uv0 + vec2(0.0, o.y)).g, texture(dynShadow, uv0 - vec2(0.0, o.y)).g)));\n"
-"	oReactive = vec4(max(vel.a > 1.5 ? 0.9 : 0.0, smoothstep(0.02, 0.25, dyn)*0.9), 0.0, 0.0, 1.0);\n"
+"    // Retain temporal smoothing on matching surfaces. Reject only disocclusions,\n"
+"    // changed actors, moving shadows, and large changes in reflected radiance.\n"
+"    vec2 previousUV=uv-jitterUV-v+prevJitterUV;\n"
+"    vec4 now=texelFetch(dynamicMask,p,0);\n"
+"    float reactive=0.0;\n"
+"    vec4 world=invVP*vec4(uv*2.0-1.0,d*2.0-1.0,1.0);\n"
+"    vec4 oldClip=prevVP*vec4(world.xyz/world.w,1.0);\n"
+"    float expected=oldClip.z/oldClip.w*0.5+0.5;\n"
+"    float tolerance=0.00002+abs(dFdx(expected))*2.0+abs(dFdy(expected))*2.0;\n"
+"    if(maskHistoryValid>0.5){\n"
+"      if(any(lessThan(previousUV,vec2(0))) || any(greaterThan(previousUV,vec2(1)))) reactive=1.0;\n"
+"      else{\n"
+"        vec2 pixel=previousUV*lowSize-0.5;ivec2 base=ivec2(floor(pixel));vec2 f=fract(pixel);\n"
+"        for(int y=0;y<2;y++)for(int x=0;x<2;x++){\n"
+"          float weight=(x==0?1.0-f.x:f.x)*(y==0?1.0-f.y:f.y);\n"
+"          if(weight<0.12)continue;\n"
+"          vec4 old=texelFetch(prevDynamicMask,clamp(base+ivec2(x,y),ivec2(0),ivec2(lowSize)-1),0);\n"
+"          if(abs(old.b-now.b)>0.25 || (vel.a>=0.0 && vel.a<0.5 && abs(old.g-expected)>tolerance))reactive=1.0;\n"
+"          reactive=max(reactive,smoothstep(0.05,0.25,abs(old.r-now.r)));\n"
+"          if(now.b<0.0)reactive=max(reactive,smoothstep(0.12,0.4,abs(old.a-now.a))*0.45);\n"
+"        }\n"
+"      }\n"
+"    }\n"
+"    oReactive = vec4(reactive, 0.0, 0.0, 1.0);\n"
+"    if(reactive>0.5) oColor.rgb=reactiveAA(uv,oColor.rgb);\n"
 "}\n";
 
 static const char *rsMfxCopySrc =
@@ -1956,6 +2094,10 @@ static const char *rsMfxCopySrc =
 "}\n";
 
 static GLuint rsMfxPrepProg, rsMfxCopyProg, rsMfxFbo;
+static GLuint rsMfxMaskProg, rsMfxMaskFbo, rsMfxMaskTex[2];
+static int rsMfxMaskCur;
+static bool rsMfxMaskValid;
+static float rsMfxPrevJitter[2];
 static unsigned rsMfxTex[5];
 static int rsMfxIn[2], rsMfxOut[2];
 static bool rsMfxReady, rsMfxFailed;
@@ -1979,8 +2121,9 @@ rsMfxEnsure(void)
 	rsMfxReady = false;
 	if(!rsMfxPrepProg){
 		rsMfxPrepProg = rsCompile(rsVertSrc, rsMfxPrepSrc);
+		rsMfxMaskProg = rsCompile(rsVertSrc, rsMfxMaskSrc);
 		rsMfxCopyProg = rsCompile(rsVertSrc, rsMfxCopySrc);
-		if(!rsMfxPrepProg || !rsMfxCopyProg){ rsMfxLog("shader compile failed, using the GLSL resolve"); rsMfxFailed = true; return false; }
+		if(!rsMfxPrepProg || !rsMfxCopyProg || !rsMfxMaskProg){ rsMfxLog("shader compile failed, using the GLSL resolve"); rsMfxFailed = true; return false; }
 	}
 	if(!mfxSetup(rsW, rsH, rsOutW, rsOutH, rsMfxTex)){
 		rsMfxLog("setup failed, using the GLSL resolve");
@@ -1996,6 +2139,27 @@ rsMfxEnsure(void)
 	static const GLenum bufs[4] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2, GL_COLOR_ATTACHMENT3 };
 	glDrawBuffers(4, bufs);
 	GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+	// Per-frame dynamic coverage, kept separately from the combined reactive mask to prevent feedback trails.
+	GLint prevMaskTex;
+	glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevMaskTex);
+	if(!rsMfxMaskFbo) glGenFramebuffers(1, &rsMfxMaskFbo);
+	if(!rsMfxMaskTex[0]) glGenTextures(2, rsMfxMaskTex);
+	glBindFramebuffer(GL_FRAMEBUFFER, rsMfxMaskFbo);
+	for(int i = 0; i < 2; i++){
+		glBindTexture(GL_TEXTURE_2D, rsMfxMaskTex[i]);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, rsW, rsH, 0, GL_RGBA, GL_FLOAT, nil);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, rsMfxMaskTex[i], 0);
+		const GLenum maskBuf = GL_COLOR_ATTACHMENT0;
+		glDrawBuffers(1, &maskBuf);
+		if(glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) st = 0;
+	}
+	glBindTexture(GL_TEXTURE_2D, prevMaskTex);
+	rsMfxMaskCur = 0;
+	rsMfxMaskValid = false;
 	glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
 	if(st != GL_FRAMEBUFFER_COMPLETE){
 		char b[96];
@@ -2016,10 +2180,13 @@ rsMetalFXPass(void)
 {
 	if(!rsMfxEnsure()) return false;
 	Gl3Raster *natzb = PLUGINOFFSET(Gl3Raster, rsCamera->zBuffer->parent, nativeRasterOffset);
-	GLint prevTex0, prevTex1, prevTex3, prevRect0;
+	GLint prevTex0, prevTex1, prevTex3, prevTex4, prevTex5, prevRect0;
 	glActiveTexture(GL_TEXTURE0); glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex0); glGetIntegerv(GL_TEXTURE_BINDING_RECTANGLE, &prevRect0);
 	glActiveTexture(GL_TEXTURE1); glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex1);
 	glActiveTexture(GL_TEXTURE3); glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex3);
+
+	glActiveTexture(GL_TEXTURE4); glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex4);
+	glActiveTexture(GL_TEXTURE5); glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex5);
 
 	// convert: colour, depth and motion vectors into the shared textures
 	glBindFramebuffer(GL_FRAMEBUFFER, rsMfxFbo);
@@ -2033,6 +2200,9 @@ rsMetalFXPass(void)
 	glBindTexture(GL_TEXTURE_2D, rsVelTex);
 	glActiveTexture(GL_TEXTURE0);
 	glBindTexture(GL_TEXTURE_2D, rsTex);
+	// Reactive spatial AA samples between pixels; the scene target normally uses nearest filtering.
+	glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);
 	glUniform1i(glGetUniformLocation(rsMfxPrepProg, "colorTex"), 0);
 	glUniform1i(glGetUniformLocation(rsMfxPrepProg, "depthTex"), 1);
 	glUniform1i(glGetUniformLocation(rsMfxPrepProg, "velTex"), 3);
@@ -2041,15 +2211,38 @@ rsMetalFXPass(void)
 	glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevDynTex);
 	glBindTexture(GL_TEXTURE_2D, gShadowStrengthNow > 0.001f ? gShadowOutTex : 0);
 	glActiveTexture(GL_TEXTURE0);
-	glUniform1i(glGetUniformLocation(rsMfxPrepProg, "dynShadow"), 2);
+	// First produce this frame's coverage without any history, then reproject the previous coverage in the prep pass.
+	int maskWrite = rsMfxMaskCur ^ 1;
+	glBindFramebuffer(GL_FRAMEBUFFER, rsMfxMaskFbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, rsMfxMaskTex[maskWrite], 0);
+	glUseProgram(rsMfxMaskProg);
+	glUniform1i(glGetUniformLocation(rsMfxMaskProg, "velTex"), 3);
+	glUniform1i(glGetUniformLocation(rsMfxMaskProg,"depthTex"),1);
+	glUniform1i(glGetUniformLocation(rsMfxMaskProg,"colorTex"),0);
+	glUniform1i(glGetUniformLocation(rsMfxMaskProg, "dynShadow"), 2);
+	glUniform2f(glGetUniformLocation(rsMfxMaskProg, "lowSize"), (float)rsW, (float)rsH);
+	glDrawArrays(GL_TRIANGLES, 0, 3);
+	glBindFramebuffer(GL_FRAMEBUFFER, rsMfxFbo);
+	glUseProgram(rsMfxPrepProg);
+	glActiveTexture(GL_TEXTURE4); glBindTexture(GL_TEXTURE_2D, rsMfxMaskTex[maskWrite]);
+	glActiveTexture(GL_TEXTURE5); glBindTexture(GL_TEXTURE_2D, rsMfxMaskTex[rsMfxMaskCur]);
+	glActiveTexture(GL_TEXTURE0);
+	glUniform1i(glGetUniformLocation(rsMfxPrepProg, "dynamicMask"), 4);
+	glUniform1i(glGetUniformLocation(rsMfxPrepProg, "prevDynamicMask"), 5);
+	glUniform1f(glGetUniformLocation(rsMfxPrepProg, "maskHistoryValid"), rsMfxMaskValid && gHistValid ? 1.0f : 0.0f);
+	glUniform2f(glGetUniformLocation(rsMfxPrepProg, "prevJitterUV"), rsMfxPrevJitter[0], rsMfxPrevJitter[1]);
 	glUniform2f(glGetUniformLocation(rsMfxPrepProg, "lowSize"), (float)rsW, (float)rsH);
-	glUniformMatrix4fv(glGetUniformLocation(rsMfxPrepProg, "invVP"), 1, GL_FALSE, gInvVP);
+	glUniform2f(glGetUniformLocation(rsMfxPrepProg, "jitterUV"), gCurRTJitter[0], gCurRTJitter[1]);
+	glUniformMatrix4fv(glGetUniformLocation(rsMfxPrepProg, "invVP"), 1, GL_FALSE, gInvVPJit);
 	glUniformMatrix4fv(glGetUniformLocation(rsMfxPrepProg, "prevVP"), 1, GL_FALSE, gPrevVP);
 	glDrawArrays(GL_TRIANGLES, 0, 3);
 #ifndef RW_METALGL
 	glFinish();	// the shared textures must be complete before Metal reads them
 #endif
 
+	glActiveTexture(GL_TEXTURE0);glBindTexture(GL_TEXTURE_2D,rsTex);
+	glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
 	bool ok = mfxRun(gJit[0]*gMfxJitterSignX, gJit[1]*gMfxJitterSignY, gHistValid ? 0 : 1) != 0;
 	if(ok){
 		// result -> history texture (so the sharpening pass and the next frame find it where they expect it)
@@ -2062,12 +2255,17 @@ rsMetalFXPass(void)
 		glUniform1i(glGetUniformLocation(rsMfxCopyProg, "src"), 0);
 		glDrawArrays(GL_TRIANGLES, 0, 3);
 		rsHistCur = cur;
+		rsMfxMaskCur = maskWrite;
+		rsMfxMaskValid = true;
+		memcpy(rsMfxPrevJitter, gCurRTJitter, sizeof(rsMfxPrevJitter));
 	}else{
 		rsMfxLog("run failed, using the GLSL resolve");
 		rsMfxFailed = true;
 		mfxShutdown();
 		rsMfxReady = false;
 	}
+	glActiveTexture(GL_TEXTURE5); glBindTexture(GL_TEXTURE_2D, prevTex5);
+	glActiveTexture(GL_TEXTURE4); glBindTexture(GL_TEXTURE_2D, prevTex4);
 	glActiveTexture(GL_TEXTURE3); glBindTexture(GL_TEXTURE_2D, prevTex3);
 	glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, prevDynTex);
 	glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, prevTex1);
@@ -2085,14 +2283,23 @@ struct RtEnv {
 	float sunVisibility;
 	float shadowDistance;
 	int shadows;
+	float giStrength, lightStrength;
+	float camera[3]; int shaftQuality;
 };
 int mrtSetup(int width, int height, unsigned *glTex);
 void mrtShutdown(void);
 int mrtReady(void);
 int mrtAddGeometry(const float *positions, int numVerts, int numMeshes, const uint32_t *const *indices, const int *indexCount, const float *colours, const int *meshCasts);
+int mrtAddAnimatedGeometry(uintptr_t key, const float *positions, int numVerts, int numMeshes, const uint32_t *const *indices, const int *indexCount, const float *colours);
 void mrtFrameBegin(void);
-void mrtAddInstance(int geometry, const float *world, uintptr_t key);
+int mrtAnimatedCurrent(uintptr_t key);
+void mrtAddInstance(int geometry, const float *world, uintptr_t key, int dynamic);
+void mrtAddVehicleInstance(int geometry, const float *world, uintptr_t key, uint32_t owner);
 int mrtTrace(const float *invViewProj, const RtEnv *env);
+void mrtSetSceneTextures(unsigned colour, unsigned depth);
+void mrtSetVelocityTexture(unsigned texture);
+void mrtSetVehicleInstanceColours(uintptr_t key, uint32_t primary, uint32_t secondary);
+void mrtSetGeometrySurfaces(int geometry, uintptr_t revision, const float *uv, int numMeshes, const uint32_t *const *indices, const int *counts, const unsigned *textures, const float *tints, const uint32_t *paint);
 }
 
 static RtEnv gRTEnv = { {0.3f,0.5f,0.9f}, {0.7f,0.8f,0.9f}, {0.3f,0.3f,0.3f}, {0,0,-1}, {0.6f,0.6f,0.5f}, 250.0f, 200.0f, {0,0,1}, 0.0f, 120.0f, 0 };
@@ -2120,6 +2327,34 @@ struct RtGeom { int id; int numVerts; uint32 numIdx; };
 static std::unordered_map<const void*, RtGeom> gRTGeom;
 static std::unordered_map<uint32, std::array<float,3> > gRTTexColour;
 static uint32 gRTLastFrame = 0xFFFFFFFFu;
+static bool gRTCollectPed;
+static bool gRTPedAccepted;
+static bool gRTCollectVehicle; // explicit scene collection bypasses screen draw culling
+static bool gRTVehicleAccepted;
+static unsigned gRTColour1,gRTColour2;
+static const void *const *gRTPaint1;
+static const void *const *gRTPaint2;
+
+// Half-float motion attachment stores exact integer tags through 2047. Recycle inactive clumps only.
+extern "C" int regtaRTVehicleOwner(void *clump)
+{
+	struct Owner { int tag; uint32_t seen; };
+	static std::unordered_map<void*, Owner> owners;
+	if(!clump) return 0;
+	auto found = owners.find(clump);
+	if(found != owners.end()){ found->second.seen = gFrameIdx; return found->second.tag; }
+	int tag = (int)owners.size()+1;
+	if(owners.size() >= 2047){
+		auto oldest = owners.end();
+		for(auto it=owners.begin(); it!=owners.end(); ++it)
+			if((uint32_t)gFrameIdx-it->second.seen > 2 && (oldest==owners.end() || it->second.seen < oldest->second.seen)) oldest=it;
+		if(oldest==owners.end()) return 0;
+		tag=oldest->second.tag; owners.erase(oldest);
+	}
+	owners[clump] = {tag,(uint32_t)gFrameIdx};
+	return tag;
+}
+
 
 // average colour of a texture (its smallest mip level)
 static void
@@ -2159,7 +2394,7 @@ void
 rtCollect(Atomic *atomic, InstanceDataHeader*)
 {
 	struct Timer { double t0; Timer(){ t0 = perfNow(); } ~Timer(){ gCollectAcc += perfNow() - t0; } } timer;
-	if(!rtActive() || !gScaledFrame || !rsCamera || engine->currentCamera != rsCamera) return;
+	if(!rtActive() || !rsCamera || (!(gRTCollectVehicle || gRTCollectPed) && (!gScaledFrame || engine->currentCamera != rsCamera))) return;
 	if(gRTLastFrame != (uint32)gFrameIdx){
 		gRTLastFrame = (uint32)gFrameIdx;
 		if(mrtReady()) mrtFrameBegin();
@@ -2167,17 +2402,33 @@ rtCollect(Atomic *atomic, InstanceDataHeader*)
 	if(!mrtReady()) return;
 	Geometry *g = atomic->geometry;
 	if(!g || !g->meshHeader || g->numMorphTargets < 1 || !g->morphTargets[0].vertices || g->numVertices <= 0) return;
-	if(Skin::get(g)) return;
+	Skin *skin = Skin::get(g);
+	if(gRTCollectPed && skin && mrtAnimatedCurrent((uintptr_t)atomic)){gRTPedAccepted=true;return;}
+	if(regtaRTVehicle && !skin && !gRTCollectVehicle) return; // collect complete high-detail cars once, after drawing
+	if(skin && !rtWantsRefl()) return;
+	std::vector<float> posed;
+	if(skin){
+		if(skin->numBones <= 0 || skin->numBones > 64 || !skin->weights || !skin->indices) return;
+		float bones[64*16];
+		getSkinMatrices(atomic, bones);
+		posed.resize(g->numVertices*3);
+		if(!skinutil::positionsParallel(posed.data(), (const float*)g->morphTargets[0].vertices,
+		                        g->numVertices, skin->weights, skin->indices, bones, skin->numBones)) return;
+	}
 	MeshHeader *mh = g->meshHeader;
-	RtGeom &e = gRTGeom[g];
+	RtGeom animated = { -3, 0, 0 };
+	RtGeom &e = skin ? animated : gRTGeom[g];
 	if(e.id == 0 && e.numVerts == 0){ e.id = -3; }	// new entry
 	if(e.id >= 0 && (e.numVerts != g->numVertices || e.numIdx != mh->totalIndices)) e.id = -3;
 	if(e.id == -3 || e.id == -2){
 		std::vector<std::vector<uint32_t> > lists(mh->numMeshes);
 		std::vector<const uint32_t*> ptrs(mh->numMeshes);
 		std::vector<int> counts(mh->numMeshes);
+		std::vector<unsigned> textures(mh->numMeshes);
+		std::vector<float> tints(mh->numMeshes*4);
+		std::vector<uint32_t> paint(mh->numMeshes);
 		std::vector<float> colours(mh->numMeshes*6);
-		std::vector<int> meshCasts(mh->numMeshes, 1);	// alpha tested / blended meshes (leaves, fences, glass) would cast solid shadows
+		std::vector<int> meshCasts(mh->numMeshes, 3);	// alpha tested / blended meshes (leaves, fences, glass) would cast solid shadows
 		bool groundLike = false;
 		Mesh *meshes = mh->getMeshes();
 		bool bad = false;
@@ -2202,6 +2453,15 @@ rtCollect(Atomic *atomic, InstanceDataHeader*)
 			float tc[3];
 			rtTextureColour(me->material ? me->material->texture : nil, tc);
 			RGBA mc = me->material ? me->material->color : RGBA{255,255,255,255};
+			if(gRTCollectVehicle){
+				if(gRTPaint1) for(auto p=gRTPaint1;*p;p++) if(*p==me->material) paint[m]=1;
+				if(gRTPaint2) for(auto p=gRTPaint2;*p;p++) if(*p==me->material) paint[m]=2;
+			}
+			if(paint[m]) mc=RGBA{255,255,255,255};
+			for(int c=0;c<4;c++) tints[m*4+c]=((uint8*)&mc)[c]/255.0f;
+			Texture *texture=me->material ? me->material->texture : nil;
+			if(texture && texture->raster && !(paint[m] && texture->name[0]=='@'))
+				textures[m]=PLUGINOFFSET(Gl3Raster,texture->raster,nativeRasterOffset)->texid;
 			if(mc.alpha < 255) meshCasts[m] = 0;
 			if(me->material && me->material->texture && me->material->texture->raster &&
 			   PLUGINOFFSET(Gl3Raster, me->material->texture->raster, nativeRasterOffset)->hasAlpha) meshCasts[m] = 0;
@@ -2217,7 +2477,7 @@ rtCollect(Atomic *atomic, InstanceDataHeader*)
 			}
 			colours[m*6+3] = pl[0]; colours[m*6+4] = pl[1]; colours[m*6+5] = pl[2];
 		}
-		if(!bad && !regtaVelocityDynamic){
+		if(!bad && !skin && !gRTCollectVehicle && !regtaVelocityDynamic){
 			// ground-like meshes (roads, pavements, grass, terrain) must not cast shadows: they lie on or just under the surfaces
 			// that receive them, so rays hit them by accident and leave large dark patches. Skip flat meshes and meshes that are
 			// mostly horizontal, upward facing surface.
@@ -2245,18 +2505,55 @@ rtCollect(Atomic *atomic, InstanceDataHeader*)
 			float upShare = areaAll > 0.0f ? areaUp/areaAll : 0.0f;
 			if(height < 0.35f || upShare > 0.5f || (upShare > 0.25f && height < 0.12f*extent)) groundLike = true;
 		}
-		if(groundLike) for(auto &c : meshCasts) c = 0;
+		if(groundLike) for(auto &c : meshCasts) c &= ~1; // suppress surface acne, retain opaque roofs/terrain as volume occluders
 		if(bad){
 			e.id = -1;
 		}else{
-			int id = mrtAddGeometry((const float*)g->morphTargets[0].vertices, g->numVertices, (int)mh->numMeshes, ptrs.data(), counts.data(), colours.data(), meshCasts.data());
+			int id = skin ? mrtAddAnimatedGeometry((uintptr_t)atomic, posed.data(), g->numVertices, (int)mh->numMeshes,
+			                                      ptrs.data(), counts.data(), colours.data()) :
+			                mrtAddGeometry((const float*)g->morphTargets[0].vertices, g->numVertices, (int)mh->numMeshes,
+			                               ptrs.data(), counts.data(), colours.data(), meshCasts.data());
+			if(id>=0) mrtSetGeometrySurfaces(id,(uintptr_t)g,g->numTexCoordSets ? (const float*)g->texCoords[0] : nil,
+			                               mh->numMeshes,ptrs.data(),counts.data(),textures.data(),tints.data(),paint.data());
 			e.id = id;
 			e.numVerts = g->numVertices;
 			e.numIdx = mh->totalIndices;
 		}
 	}
-	if(e.id >= 0)
-		mrtAddInstance(e.id, (const float*)&uniformObject.world, regtaVelocityDynamic ? 0 : (uintptr_t)atomic->getFrame()->getLTM());
+	if(e.id >= 0){
+		RawMatrix world;
+		convMatrix(&world, atomic->getFrame()->getLTM());
+		if(gRTCollectVehicle || ((skin || gRTCollectPed) && regtaRTVehicleClump)){
+			mrtAddVehicleInstance(e.id, (const float*)&world, (uintptr_t)atomic->getFrame()->getLTM(), regtaRTVehicleOwner(gRTCollectVehicle ? (void*)atomic->clump : regtaRTVehicleClump));
+			if(gRTCollectVehicle) mrtSetVehicleInstanceColours((uintptr_t)atomic->getFrame()->getLTM(),gRTColour1,gRTColour2);
+		}else
+			mrtAddInstance(e.id, (const float*)&world, (uintptr_t)atomic->getFrame()->getLTM(), skin || gRTCollectPed || (regtaVelocityDynamic && !regtaRTStaticObject));
+		if(gRTCollectVehicle) gRTVehicleAccepted = true;
+		if(gRTCollectPed) gRTPedAccepted = true;
+	}
+}
+
+// Collect geometry without selecting a shader, drawing, or modifying the motion-vector state.
+extern "C" int
+regtaRTCollectVehicleAtomic(void *object, unsigned primary, unsigned secondary, const void *const *paint1, const void *const *paint2)
+{
+	bool previous = gRTCollectVehicle;
+	gRTColour1=primary;gRTColour2=secondary;gRTPaint1=paint1;gRTPaint2=paint2;
+	gRTCollectVehicle = true;
+	gRTVehicleAccepted = false;
+	rtCollect((Atomic*)object, nil);
+	gRTCollectVehicle = previous;
+	return gRTVehicleAccepted ? 1 : 0;
+}
+
+extern "C" int
+regtaRTCollectPedAtomic(void *object, void *vehicleClump)
+{
+	void *previous=regtaRTVehicleClump;
+	regtaRTVehicleClump=vehicleClump;gRTCollectPed=true;gRTPedAccepted=false;
+	rtCollect((Atomic*)object,nil);
+	gRTCollectPed=false;regtaRTVehicleClump=previous;
+	return gRTPedAccepted ? 1 : 0;
 }
 
 // REGTA_DEBUG_RT=1: draw the ray traced reflection weights in red and the traced shadows in green instead of applying them
@@ -2266,22 +2563,34 @@ static const char *rsRTPrepSrc =
 "#version 330\n"
 "uniform sampler2D depthTex;\n"
 "uniform sampler2D reflTex;\n"
+"uniform sampler2D velTex;\n"
 "uniform int div;\n"
 "layout(location = 0) out vec4 oDepth;\n"
 "layout(location = 1) out vec4 oDir;\n"
 "void main(){\n"
 "	ivec2 hi = textureSize(depthTex, 0) - 1;\n"
 "	ivec2 base = ivec2(gl_FragCoord.xy)*div;\n"
-"	// one sample per div x div block: keep the pixel with the strongest reflection (thin marked parts must not vanish)\n"
+"	// one sample per div x div block. The pixel with the strongest reflection keeps thin marked parts from vanishing, but on\n"
+"	// paint all pixels of a block are about equal and the winner changed with every frame's camera jitter: the traced spot\n"
+"	// hopped inside the block (shimmering, stair-stepped reflections). Take the same pixel every frame (the first in a fixed\n"
+"	// centre-out order) whenever it reflects at least half as strongly as the strongest one.\n"
+"	float strongest = 0.0;\n"
+"	for(int y = 0; y < div; y++)\n"
+"	for(int x = 0; x < div; x++)\n"
+"		strongest = max(strongest, texelFetch(reflTex, clamp(base + ivec2(x, y), ivec2(0), hi), 0).w);\n"
 "	vec4 best = vec4(0.0);\n"
 "	ivec2 bp = clamp(base, ivec2(0), hi);\n"
+"	float bestRank = 1e9;\n"
+"	vec2 mid = vec2(div - 1)*0.5;\n"
 "	for(int y = 0; y < div; y++)\n"
 "	for(int x = 0; x < div; x++){\n"
 "		ivec2 q = clamp(base + ivec2(x, y), ivec2(0), hi);\n"
 "		vec4 d = texelFetch(reflTex, q, 0);\n"
-"		if(d.w > best.w){ best = vec4(d.xyz*2.0 - 1.0, d.w); bp = q; }	// 8 bit direction: *2-1\n"
+"		if(d.w <= 0.0 || d.w < strongest*0.5) continue;\n"
+"		float rank = dot(vec2(x, y) - mid, vec2(x, y) - mid) + float(y*div + x)*0.001;\n"
+"		if(rank < bestRank){ bestRank = rank; best = vec4(d.xyz*2.0 - 1.0, d.w); bp = q; }	// encoded direction: *2-1\n"
 "	}\n"
-"	oDepth = vec4(texelFetch(depthTex, bp, 0).r, 0.0, 0.0, 1.0);\n"
+"	oDepth = vec4(texelFetch(depthTex, bp, 0).r, (vec2(bp) + 0.5)/vec2(hi + 1), max(-texelFetch(velTex, bp, 0).b, 0.0));\n"
 "	oDir = best;\n"
 "}\n";
 
@@ -2298,11 +2607,14 @@ static const char *rsRTCompositeSrc =
 "	ivec2 p = ivec2(gl_FragCoord.xy);\n"
 "	float w = texelFetch(reflTex, p, 0).a;\n"
 "	float velA = texelFetch(velTex, p, 0).a;\n"
-"	if(velA > 1.5 || velA < 0.5) discard;	// only cars: characters never get one, the ground takes its own reflection in its shader\n"
+"	if(velA > 1.5) discard;	// Characters never receive a reflection coat.\n"
 "	if(w <= 0.001) discard;\n"
-"	// soften the traced image a little (ripples, and the reflected colours are only per-material averages)\n"
-"	// the traced image is smaller than the screen: sample it with bilinear filtering (smooth, no blocks)\n"
-"	vec4 r = texture(rtTex, (vec2(p) + 0.5)/float(div));\n""	fragColor = dbg > 0.5 ? vec4(1.0, 0.0, 0.0, clamp(w*2.0, 0.0, 1.0)) : vec4(r.rgb, clamp(w*strength, 0.0, 1.0));\n"
+"	// Full resolution samples texel centres; reduced quality uses bilinear reconstruction.\n"
+"	vec4 r = texture(rtTex, (vec2(p) + 0.5)/float(div));\n"
+"	bool car = velA < 0.0 || velA > 0.5;\n"
+"	bool ground = texelFetch(velTex, p, 0).b > 0.5;\n"
+"	float coverage = car ? clamp(w*strength*2.0, 0.0, 0.9) : clamp(w*(ground ? strength : 1.0), 0.0, 1.0);\n"
+"	fragColor = dbg > 0.5 ? vec4(1.0, 0.0, 0.0, clamp(w*2.0, 0.0, 1.0)) : vec4(r.rgb, coverage*r.a);\n"
 "}\n";
 
 static const char *rsRTShadowSrc =
@@ -2316,38 +2628,63 @@ static const char *rsRTShadowSrc =
 "uniform vec2 nearFar;\n"
 "uniform int div;\n"
 "uniform float dbg;\n"
+"uniform float aoStrength;\n"
+"uniform sampler2DRect lightRect;\n"
+"uniform float extraOn;\n"
 "out vec4 fragColor;\n"
 "float lin(float d){\n"
 "	float z = d*2.0 - 1.0;\n"
 "	return 2.0*nearFar.x*nearFar.y/(nearFar.y + nearFar.x - z*(nearFar.y - nearFar.x));\n"
 "}\n"
+"// depth slope of the surface at c (raw depth is linear across the screen on a plane): the smaller one-sided step per axis\n"
+"vec2 slope(ivec2 c, ivec2 hi, float d){\n"
+"	float x1 = texelFetch(depthFull, clamp(c + ivec2(1, 0), ivec2(0), hi), 0).r - d, x0 = d - texelFetch(depthFull, clamp(c - ivec2(1, 0), ivec2(0), hi), 0).r;\n"
+"	float y1 = texelFetch(depthFull, clamp(c + ivec2(0, 1), ivec2(0), hi), 0).r - d, y0 = d - texelFetch(depthFull, clamp(c - ivec2(0, 1), ivec2(0), hi), 0).r;\n"
+"	return vec2(abs(x1) < abs(x0) ? x1 : x0, abs(y1) < abs(y0) ? y1 : y0);\n"
+"}\n"
 "void main(){\n"
 "	ivec2 p = ivec2(gl_FragCoord.xy);\n"
 "	ivec2 hi = textureSize(depthRect) - 1;\n"
 "	// wet ground with puddles (or a reflection) gets no traced shadow: the two effects mixed into flickering patches\n"
-"	// level ground already took the static map shadows in its own shader: it only needs the dynamic ones (cars, props) here\n"
-"	bool ground = texelFetch(velTex, p, 0).b > 0.5;\n"
+"	// All receiving surfaces use this frame's shadow trace, including ground exposed by a moving object.\n"
 "	float puddleW = texelFetch(reflTex, p, 0).a;\n"
 "	float dc = texelFetch(depthFull, p, 0).r;\n"
 "	if(dc >= 0.99999) discard;\n"
 "	float lc = lin(dc);\n"
 "	// depth aware blur: the shadow rays are noisy (one ray per pixel), so smooth between pixels of the same surface\n"
-"	float sum = 0.0, ws = 0.0;\n"
+"	float sum = 0.0, aoSum = 0.0, ws = 0.0;\n"
+"	vec3 lightSum = vec3(0.0);\n"
 "	ivec2 c = p/div;\n"
 "	float sigma = div > 1 ? 0.45 : 0.2;\n"
+"	// compare each neighbour with the depth this surface would have there, not with the centre depth: on ground seen at a\n"
+"	// grazing angle the depth changes fast between rows and the plain test kept only one or two taps (grainy floor shadows)\n"
+"	// Anchor the plane at the full-resolution receiving surface, never a different surface in its reduced block.\n"
+"	vec2 g = slope(p, textureSize(depthFull, 0) - 1, dc);\n"
 "	for(int y = -2; y <= 2; y++)\n"
 "	for(int x = -2; x <= 2; x++){\n"
 "		ivec2 q = clamp(c + ivec2(x, y), ivec2(0), hi);\n"
 "		float lq = lin(texelFetch(depthRect, q).r);\n"
-"		float w = exp(-float(x*x + y*y)*sigma)*exp(-abs(lq - lc)/(0.03*lc + 0.05));\n"
-"		vec2 sd = texelFetch(shadowTex, q).rg;\n"
-"		sum += (ground ? sd.g : max(sd.r, sd.g))*w;\n"
+"		vec2 delta = texelFetch(depthRect, q).gb*vec2(textureSize(depthFull, 0)) - (vec2(p) + 0.5);\n"
+"		float lp = lin(clamp(dc + dot(g, delta), 0.0, 0.999999));\n"
+"		// spatial weight from the real distance in screen pixels between this pixel and the traced sample: with the plain\n"
+"		// integer offset every full-size pixel of a 2x2 block got the same weights, so shadow edges snapped by a whole traced\n"
+"		// pixel whenever the camera jitter moved them (edges stepping back and forth)\n"
+"		vec2 dpx = delta/float(div);\n"
+"		float w = exp(-dot(dpx, dpx)*sigma)*exp(-abs(lq - lp)/(0.03*lc + 0.05));\n"
+"		vec4 sd = texelFetch(shadowTex, q);\n"
+"		sum += max(sd.r, sd.g)*w;\n"
+"		aoSum += sd.a*w;\n"
+"		if(extraOn > 0.5) lightSum += texelFetch(lightRect, q).rgb*w;\n"
 "		ws += w;\n"
 "	}\n"
 "	float s = sum/max(ws, 1e-4);\n"
-"	s *= 1.0 - clamp(puddleW*8.0, 0.0, 1.0);\n"
-"	if(s <= 0.004) discard;\n"
-"	fragColor = dbg > 0.5 ? vec4(0.0, 1.0, 0.0, clamp(s*2.0, 0.0, 1.0)) : vec4(vec3(1.0 - s*strength), 1.0);\n"
+"	// Preserve the reflected contribution while shadowing the ground from the current trace.\n"
+"	s *= 1.0 - clamp(puddleW, 0.0, 1.0);\n"
+"	float ao = aoSum/max(ws, 1e-4);\n"
+"	float shade = (1.0 - s*strength)*(1.0 - clamp(ao*aoStrength, 0.0, 0.85));\n"
+"	vec3 f = shade*(vec3(1.0) + min(lightSum/max(ws, 1e-4), vec3(2.0)));\n"
+"	if(all(lessThan(abs(f - 1.0), vec3(0.004)))) discard;\n"
+"	fragColor = dbg > 0.5 ? vec4(ao, 1.0, 0.0, clamp(s*2.0 + ao, 0.0, 1.0)) : vec4(min(f*0.5, vec3(1.0)), 1.0);\n"
 "}\n";
 
 // softens the traced images once per frame (depth aware for the shadows) so ground shaders need one filtered tap each
@@ -2363,17 +2700,26 @@ static const char *rsRTBlurSrc =
 "	float z = d*2.0 - 1.0;\n"
 "	return 2.0*nearFar.x*nearFar.y/(nearFar.y + nearFar.x - z*(nearFar.y - nearFar.x));\n"
 "}\n"
+"// depth slope of the surface at c (raw depth is linear across the screen on a plane): the smaller one-sided step per axis\n"
+"vec2 slope(ivec2 c, ivec2 hi, float d){\n"
+"	float x1 = texelFetch(depthRect, clamp(c + ivec2(1, 0), ivec2(0), hi)).r - d, x0 = d - texelFetch(depthRect, clamp(c - ivec2(1, 0), ivec2(0), hi)).r;\n"
+"	float y1 = texelFetch(depthRect, clamp(c + ivec2(0, 1), ivec2(0), hi)).r - d, y0 = d - texelFetch(depthRect, clamp(c - ivec2(0, 1), ivec2(0), hi)).r;\n"
+"	return vec2(abs(x1) < abs(x0) ? x1 : x0, abs(y1) < abs(y0) ? y1 : y0);\n"
+"}\n"
 "void main(){\n"
 "	ivec2 p = ivec2(gl_FragCoord.xy);\n"
 "	ivec2 hi = textureSize(depthRect) - 1;\n"
-"	float lc = lin(texelFetch(depthRect, p).r);\n"
+"	float d0 = texelFetch(depthRect, p).r;\n"
+"	float lc = lin(d0);\n"
+"	vec2 g = slope(p, hi, d0);\n"
 "	vec3 sum = vec3(0.0);\n"
 "	float ws = 0.0;\n"
 "	for(int y = -2; y <= 2; y++)\n"
 "	for(int x = -2; x <= 2; x++){\n"
 "		ivec2 q = clamp(p + ivec2(x, y), ivec2(0), hi);\n"
 "		float lq = lin(texelFetch(depthRect, q).r);\n"
-"		float w = exp(-float(x*x + y*y)*0.45)*exp(-abs(lq - lc)/(0.03*lc + 0.05));\n"
+"		float lp = lin(clamp(d0 + g.x*float(x) + g.y*float(y), 0.0, 0.999999));\n"
+"		float w = exp(-float(x*x + y*y)*0.45)*exp(-abs(lq - lp)/(0.03*lc + 0.05));\n"
 "		sum += texelFetch(shadowTex, q).rgb*w;\n"
 "		ws += w;\n"
 "	}\n"
@@ -2387,9 +2733,39 @@ static const char *rsRTBlurSrc =
 "}\n";
 static GLuint rsBlurProg, rsBlurFbo, rsBlurTex[2];
 
+static const char *rsSunShaftSrc =
+"#version 330\n"
+"uniform sampler2DRect volumeTex;\n"
+"uniform sampler2DRect depthRect;\n"
+"uniform sampler2D depthFull;\n"
+"uniform int div;\n"
+"uniform vec2 nearFar;\n"
+"out vec4 fragColor;\n"
+"float lin(float d){float z=d*2.0-1.0;return 2.0*nearFar.x*nearFar.y/(nearFar.y+nearFar.x-z*(nearFar.y-nearFar.x));}\n"
+"void main(){\n"
+" ivec2 p=ivec2(gl_FragCoord.xy), hi=textureSize(volumeTex)-1;\n"
+" float dc=texelFetch(depthFull,p,0).r, lc=lin(dc);\n"
+" vec2 vp=(vec2(p)+0.5)/float(div*4)-0.5;\n"
+" ivec2 c=ivec2(floor(vp)); vec4 sum=vec4(0);float weight=0.0;\n"
+" for(int y=-1;y<=1;y++)for(int x=-1;x<=1;x++){\n"
+"  ivec2 q=clamp(c+ivec2(x,y),ivec2(0),hi);\n"
+"  ivec2 dp=min(q*4+2,textureSize(depthRect)-1);\n"
+"  float dq=texelFetch(depthRect,dp).r;\n"
+"  bool sky=dc>=0.99999, qsky=dq>=0.99999;\n"
+"  if(sky!=qsky)continue;\n"
+"  vec2 offset=vec2(q)-vp;\n"
+"  float w=exp(-dot(offset,offset)*1.5)*(sky?1.0:exp(-abs(lin(dq)-lc)/max(0.05,lc*0.03)));\n"
+"  sum+=texelFetch(volumeTex,q)*w;weight+=w;\n"
+" }\n"
+" // No matching endpoint: omit the volume rather than bleed it across a wall/sky edge.\n"
+" fragColor=weight>1e-5?sum/weight:vec4(0);\n"
+"}\n"
+;
+static GLuint rsSunShaftProg;
+
 static GLuint rsRTShadowProg;
 static GLuint rsRTPrepProg, rsRTCompProg, rsRTFbo;
-static unsigned rsRTTex[4];
+static unsigned rsRTTex[6];
 static int rsRTSize[2];
 static bool rsRTFailed;
 
@@ -2415,8 +2791,9 @@ rsRayTracePass(void)
 			rsRTPrepProg = rsCompile(rsVertSrc, rsRTPrepSrc);
 			rsRTCompProg = rsCompile(rsVertSrc, rsRTCompositeSrc);
 			rsRTShadowProg = rsCompile(rsVertSrc, rsRTShadowSrc);
+			rsSunShaftProg = rsCompile(rsVertSrc, rsSunShaftSrc);
 			rsBlurProg = rsCompile(rsVertSrc, rsRTBlurSrc);
-			if(!rsRTPrepProg || !rsRTCompProg || !rsRTShadowProg || !rsBlurProg){ rsRTLog("shader compile failed, ray tracing off"); rsRTFailed = true; return; }
+			if(!rsRTPrepProg || !rsRTCompProg || !rsRTShadowProg || !rsSunShaftProg || !rsBlurProg){ rsRTLog("shader compile failed, ray tracing off"); rsRTFailed = true; return; }
 		}
 		gRTGeom.clear();
 		gRTOutTex = 0;
@@ -2484,6 +2861,10 @@ rsRayTracePass(void)
 	glBindTexture(GL_TEXTURE_2D, rsReflTex);
 	glUniform1i(glGetUniformLocation(rsRTPrepProg, "depthTex"), 0);
 	glUniform1i(glGetUniformLocation(rsRTPrepProg, "reflTex"), 1);
+	glActiveTexture(GL_TEXTURE2);
+	glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex2);
+	glBindTexture(GL_TEXTURE_2D, rsVelTex);
+	glUniform1i(glGetUniformLocation(rsRTPrepProg, "velTex"), 2);
 	glUniform1i(glGetUniformLocation(rsRTPrepProg, "div"), gRTDiv);
 	glDrawArrays(GL_TRIANGLES, 0, 3);
 #ifndef RW_METALGL
@@ -2493,11 +2874,28 @@ rsRayTracePass(void)
 	gRTEnv.maxDistance = gRTDistance;
 	gRTEnv.fogDistance = gRTDistance*0.8f;
 	gRTEnv.shadowDistance = gRTShadowDistance;
+	gRTEnv.shaftQuality = regtaGfxSunShafts > 0 ? (regtaGfxSunShafts > 3 ? 3 : regtaGfxSunShafts) : 0;
+	memcpy(gRTEnv.camera, &rsCamera->getFrame()->getLTM()->pos.x, 12);
 	gCoverNow = rtWetRoads() && regtaGfxPuddles;
-	gRTEnv.shadows = (gRTShadows ? 1 : 0) | (gCoverNow ? 2 : 0);	// bit 0 sun shadows, bit 1 roof test for puddles
+	bool giOn = gGI && regtaGfxRTGI, lightsOn = gRTLights && regtaGfxRTLights;
+	if(lightsOn){
+		static float lightData[32*8];
+		mrtSetLights(lightData, regtaRTGatherLights(lightData, 32));
+	}else
+		mrtSetLights(nil, 0);
+	gRTEnv.giStrength = gGIStrength;
+	gRTEnv.lightStrength = gRTLightStrength;
+	gRTEnv.shadows = (gRTShadows ? 1 : 0) | (gCoverNow ? 2 : 0) | (gAO && regtaGfxRTAO ? 4 : 0) | (giOn ? 8 : 0) | (lightsOn ? 16 : 0);	// bit 0 sun shadows, 1 roof test for puddles, 2 occlusion
 	gShadowStrengthNow = (gRTShadows && gRTEnv.sunVisibility > 0.01f) ? gRTShadowStrength*gRTEnv.sunVisibility : 0.0f;
+	if(rtWantsRefl() || gRTShadows || gRTEnv.shaftQuality){
+		const V3d &eye = rsCamera->getFrame()->getLTM()->pos;
+		regtaRTCollectVehicles(&eye.x, fmaxf(gRTDistance, gRTShadowDistance));
+	}
+	mrtSetSceneTextures(rsTex, natzb->texid);
+	mrtSetVelocityTexture(rsVelTex);
 	bool ok = mrtTrace(gInvVPJit, &gRTEnv) != 0;
 	if(ok){
+		memcpy(gPrevRTJitter, gCurRTJitter, sizeof(gPrevRTJitter));
 		{
 			// soften the traced images once, for the ground shaders (they read them next frame with a single tap)
 			GLint prevR0, prevR1, prevR2;
@@ -2526,26 +2924,10 @@ rsRayTracePass(void)
 		gVelBoth = 1;
 		glViewport(0, 0, rsW, rsH);
 		glEnable(GL_BLEND);
-		if(rtWantsRefl()){
-			glUseProgram(rsRTCompProg);
-			glActiveTexture(GL_TEXTURE0);
-			glBindTexture(GL_TEXTURE_RECTANGLE, rsRTTex[2]);
-			glActiveTexture(GL_TEXTURE1);
-			glBindTexture(GL_TEXTURE_2D, rsReflTex);
-			glUniform1i(glGetUniformLocation(rsRTCompProg, "rtTex"), 0);
-			glUniform1i(glGetUniformLocation(rsRTCompProg, "reflTex"), 1);
-			glUniform1i(glGetUniformLocation(rsRTCompProg, "div"), gRTDiv);
-			glActiveTexture(GL_TEXTURE2);
-			if(prevTex2 < 0) glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex2);
-			glBindTexture(GL_TEXTURE_2D, rsVelTex);
-			glActiveTexture(GL_TEXTURE0);
-			glUniform1i(glGetUniformLocation(rsRTCompProg, "velTex"), 2);
-			glUniform1f(glGetUniformLocation(rsRTCompProg, "strength"), gRTStrength);
-			glUniform1f(glGetUniformLocation(rsRTCompProg, "dbg"), rtDebugView() ? 1.0f : 0.0f);
-			glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-			glDrawArrays(GL_TRIANGLES, 0, 3);
-		}
-		if(gRTShadows && gRTEnv.sunVisibility > 0.01f){
+		bool aoOn = gAO && regtaGfxRTAO;
+		bool sunOn = gRTShadows && gRTEnv.sunVisibility > 0.01f;
+		bool extraOn = (gRTEnv.shadows & (8 | 16)) != 0;
+		if(sunOn || aoOn || extraOn){
 			// darken the scene where the sun rays were blocked
 			glUseProgram(rsRTShadowProg);
 			glActiveTexture(GL_TEXTURE0);
@@ -2571,11 +2953,54 @@ rsRayTracePass(void)
 			glUniform1i(glGetUniformLocation(rsRTShadowProg, "shadowTex"), 0);
 			glUniform1i(glGetUniformLocation(rsRTShadowProg, "depthRect"), 1);
 			glUniform2f(glGetUniformLocation(rsRTShadowProg, "nearFar"), rsCamera->nearPlane, rsCamera->farPlane);
-			glUniform1f(glGetUniformLocation(rsRTShadowProg, "strength"), gRTShadowStrength*gRTEnv.sunVisibility);
+			glUniform1f(glGetUniformLocation(rsRTShadowProg, "strength"), sunOn ? gRTShadowStrength*gRTEnv.sunVisibility : 0.0f);
+			glUniform1f(glGetUniformLocation(rsRTShadowProg, "aoStrength"), aoOn ? gAOStrength : 0.0f);
 			glUniform1f(glGetUniformLocation(rsRTShadowProg, "dbg"), rtDebugView() ? 1.0f : 0.0f);
-			if(rtDebugView()) glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); else glBlendFunc(GL_ZERO, GL_SRC_COLOR);
+			glActiveTexture(GL_TEXTURE5);
+			glBindTexture(GL_TEXTURE_RECTANGLE, rsRTTex[4]);
+			glActiveTexture(GL_TEXTURE0);
+			glUniform1i(glGetUniformLocation(rsRTShadowProg, "lightRect"), 5);
+			glUniform1f(glGetUniformLocation(rsRTShadowProg, "extraOn"), extraOn ? 1.0f : 0.0f);
+			// the output is half the factor the scene is multiplied by (dst*src + src*dst): extra light can brighten it
+			if(rtDebugView()) glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); else glBlendFunc(GL_DST_COLOR, GL_SRC_COLOR);
 			glDrawArrays(GL_TRIANGLES, 0, 3);
 		}
+		// The clear coat reflects incoming radiance; local AO and diffuse shadowing must not darken it.
+		if(rtWantsRefl()){
+			glUseProgram(rsRTCompProg);
+			glActiveTexture(GL_TEXTURE0);
+			glBindTexture(GL_TEXTURE_RECTANGLE, rsRTTex[2]);
+			glActiveTexture(GL_TEXTURE1);
+			glBindTexture(GL_TEXTURE_2D, rsReflTex);
+			glUniform1i(glGetUniformLocation(rsRTCompProg, "rtTex"), 0);
+			glUniform1i(glGetUniformLocation(rsRTCompProg, "reflTex"), 1);
+			glUniform1i(glGetUniformLocation(rsRTCompProg, "div"), gRTDiv);
+			glActiveTexture(GL_TEXTURE2);
+			if(prevTex2 < 0) glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex2);
+			glBindTexture(GL_TEXTURE_2D, rsVelTex);
+			glActiveTexture(GL_TEXTURE0);
+			glUniform1i(glGetUniformLocation(rsRTCompProg, "velTex"), 2);
+			glUniform1f(glGetUniformLocation(rsRTCompProg, "strength"), gRTStrength);
+			glUniform1f(glGetUniformLocation(rsRTCompProg, "dbg"), rtDebugView() ? 1.0f : 0.0f);
+			glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+			glDrawArrays(GL_TRIANGLES, 0, 3);
+		}
+        if(gRTEnv.shaftQuality && gRTEnv.sunVisibility > 0.01f){
+            glUseProgram(rsSunShaftProg);
+            glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_RECTANGLE, rsRTTex[5]);
+            glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_RECTANGLE, rsRTTex[0]);
+            glActiveTexture(GL_TEXTURE2);
+            if(prevTex2 < 0) glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex2);
+            glBindTexture(GL_TEXTURE_2D, natzb->texid);
+            glUniform1i(glGetUniformLocation(rsSunShaftProg,"volumeTex"),0);
+            glUniform1i(glGetUniformLocation(rsSunShaftProg,"depthRect"),1);
+            glUniform1i(glGetUniformLocation(rsSunShaftProg,"depthFull"),2);
+            glUniform1i(glGetUniformLocation(rsSunShaftProg,"div"),gRTDiv);
+            glUniform2f(glGetUniformLocation(rsSunShaftProg,"nearFar"),rsCamera->nearPlane,rsCamera->farPlane);
+            glActiveTexture(GL_TEXTURE0);
+            glBlendFunc(GL_ONE,GL_ONE_MINUS_SRC_ALPHA);
+            glDrawArrays(GL_TRIANGLES,0,3);
+        }
 		glDisable(GL_BLEND);
 	}
 	if(prevTex4 >= 0){ glActiveTexture(GL_TEXTURE4); glBindTexture(GL_TEXTURE_2D, prevTex4); }
@@ -2591,6 +3016,15 @@ static void
 resolveRenderScale(void)
 {
 	if(!gUseTarget || !gScaledFrame || !rsFbo || !rsCamera) return;
+	// CPU time of the sections of this step (REGTA_MTLGL_LOG=1: logged to metalfx.log every 240 frames)
+	static bool secLog = getenv("REGTA_MTLGL_LOG") != nullptr;
+	static double secAcc[5]; static int secFrames;
+	double secT = perfNow(), secStart = secT;
+	auto sec = [&](int i){ if(!secLog) return; double t = perfNow(); secAcc[i] += t - secT; secT = t; };
+#ifdef RW_METALGL
+	if(!mtlglResolveSceneMSAA(rsFbo)) fprintf(stderr,"Metal MSAA resolve failed\n");
+#endif
+	sec(0);
 	gScaledFrame = false;
 	double resolveT0 = perfNow();
 	// how long the scene took: CPU time since the frame began, and GPU time from a timer query (read one frame late)
@@ -2661,10 +3095,16 @@ resolveRenderScale(void)
 	glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 	glBindVertexArray(rsVao);
 
+	sec(4);
 	{
 		double t0 = perfNow();
 		rsRayTracePass();
-		gPerfMs[0] += ((float)(perfNow() - t0) - gPerfMs[0])*0.05f;
+		sec(1);
+		#ifdef RW_METALGL
+        gPerfMs[0] += (mrtGpuMilliseconds()-gPerfMs[0])*0.05f;
+#else
+        gPerfMs[0] += ((float)(perfNow() - t0) - gPerfMs[0])*0.05f;
+#endif
 	}
 
 	GLuint sharpenSrc = rsUpTex;
@@ -2672,7 +3112,12 @@ resolveRenderScale(void)
 	bool temporal = gTemporal && gJitterApplied && rsTemporalProg && rsHistTex[0] && rsVelTex && rsCamera->zBuffer;
 	double mfxT0 = perfNow();
 	bool mfxDone = temporal && gMetalFX && rsMetalFXPass();
-	gPerfMs[1] += ((mfxDone ? (float)(perfNow() - mfxT0) : 0.0f) - gPerfMs[1])*0.05f;
+	sec(2);
+	#ifdef RW_METALGL
+    gPerfMs[1] += ((mfxDone?mfxGpuMilliseconds():0.0f)-gPerfMs[1])*0.05f;
+#else
+    gPerfMs[1] += ((mfxDone ? (float)(perfNow() - mfxT0) : 0.0f) - gPerfMs[1])*0.05f;
+#endif
 	if(mfxDone){
 		gHistValid = true;
 		sharpenSrc = rsHistTex[rsHistCur];
@@ -2762,6 +3207,16 @@ resolveRenderScale(void)
 	glGlobals.presentWidth = 0;
 	setViewport(rsCamera->frameBuffer);
 	gPerfMs[2] += ((float)(perfNow() - resolveT0) - gPerfMs[2])*0.05f;
+	sec(3);
+	if(secLog && ++secFrames == 240){
+		if(FILE *f = fopen("metalfx.log", "a")){
+			fprintf(f, "CPU upscale step: total %.2f ms | MSAA resolve %.2f, setup %.2f, ray tracing pass %.2f, MetalFX pass %.2f, rest (temporal/upscale/sharpen) %.2f\n",
+				(secAcc[0] + secAcc[1] + secAcc[2] + secAcc[3] + secAcc[4])/240, secAcc[0]/240, secAcc[4]/240, secAcc[1]/240, secAcc[2]/240, secAcc[3]/240);
+			fclose(f);
+		}
+		memset(secAcc, 0, sizeof(secAcc)); secFrames = 0;
+	}
+	(void)secStart;
 }
 
 extern "C" void regtaResolveRenderScale(void) { resolveRenderScale(); }
@@ -2847,6 +3302,16 @@ regtaSceneCapture(unsigned *colorTex, unsigned *depthTex, float *texSize, float 
 static void
 syncGfxSettings(void)
 {
+	int requestedDiv=regtaGfxRTResolutionIdx==2 ? 4 : regtaGfxRTResolutionIdx==1 ? 2 : 1;
+	if(requestedDiv!=gRTDiv){
+		gRTDiv=requestedDiv;
+		rsRTSize[0]=rsRTSize[1]=0; // Reallocate tracing targets and reset RT history on the next pass.
+		gRTOutTex=gShadowOutTex=0;
+		gHistValid=false;rsMfxMaskValid=false;
+	}
+	int requestedSamples=regtaGfxMSAAIdx>=1 && regtaGfxMSAAIdx<=4 ? (1<<regtaGfxMSAAIdx) : 1;
+	if(requestedSamples!=gSceneMSAA){gHistValid=false;rsMfxMaskValid=false;}
+	gSceneMSAA=requestedSamples;
 	gTemporal = regtaGfxTemporal != 0;
 	gMetalFX = regtaGfxMetalFX != 0;
 	gSSR = regtaGfxSSR != 0;
@@ -2936,12 +3401,15 @@ beginUpdate(Camera *cam)
 		gSceneSerial++;
 		bool invOk = mat4inv(gInvVP, vp);
 		memcpy(gInvVPJit, gInvVP, sizeof(gInvVP));
+		gCurRTJitter[0] = gCurRTJitter[1] = 0.0f;
 		if(invOk && gTemporal){
 			// sub-pixel jitter (Halton 2,3) of the projection, in target pixels
 			float sc = getHidpiScale();
 			float tw = cam->frameBuffer->parent->width*sc, th = cam->frameBuffer->parent->height*sc;
 			gJit[0] = halton(gFrameIdx % 16 + 1, 2) - 0.5f;
 			gJit[1] = halton(gFrameIdx % 16 + 1, 3) - 0.5f;
+			gCurRTJitter[0] = gJit[0]/tw;
+			gCurRTJitter[1] = gJit[1]/th;
 			proj[8] += 2.0f*gJit[0]/tw;
 			proj[9] += 2.0f*gJit[1]/th;
 			gJitterApplied = true;
@@ -3608,7 +4076,8 @@ startGLFW(void)
 	glfwSetErrorCallback(glfwerr);
 	{
 		bool haveScaleIdx = false;
-		if(FILE *ini = fopen("re3.ini", "r")){
+		int rtResolutionIdx=-1;
+		if(FILE *ini = fopen(gameIniName(), "r")){
 			char line[256];
 			bool inGraphics = false;
 			while(fgets(line, sizeof(line), ini)){
@@ -3618,6 +4087,12 @@ startGLFW(void)
 					if(v >= 0.4f && v <= 1.0f) gRenderScale = v;
 				}else if(inGraphics && strncmp(line, "RenderSharpness=", 16) == 0)
 					gRenderSharpness = (float)atof(line + 16);
+				else if(inGraphics && strncmp(line,"RenderMSAAIdx=",14)==0){
+					int idx=atoi(line+14);if(idx>=0 && idx<=4){regtaGfxMSAAIdx=(int8_t)idx;gSceneMSAA=1<<idx;}
+				}
+				else if(inGraphics && strncmp(line,"RenderMSAA=",11)==0){
+					int samples=atoi(line+11);gSceneMSAA=(samples==16 || samples==8 || samples==4 || samples==2) ? samples : 1;regtaGfxMSAAIdx=gSceneMSAA==16?4:gSceneMSAA==8?3:gSceneMSAA==4?2:gSceneMSAA==2?1:0;
+				}
 				else if(inGraphics && strncmp(line, "RenderTemporal=", 15) == 0)
 					gTemporal = atoi(line + 15) != 0;
 				else if(inGraphics && strncmp(line, "VehicleSSR=", 11) == 0)
@@ -3626,10 +4101,32 @@ startGLFW(void)
 					gRT = atoi(line + 9) != 0;
 				else if(inGraphics && strncmp(line, "RenderRTStrength=", 17) == 0)
 					gRTStrength = (float)atof(line + 17);
+				else if(inGraphics && strncmp(line,"RenderRTResolutionIdx=",22)==0){
+					int idx=atoi(line+22);if(idx>=0 && idx<=2)rtResolutionIdx=idx;
+				}
 				else if(inGraphics && strncmp(line, "RenderRTHalfRes=", 16) == 0)
 					gRTDiv = atoi(line + 16) ? 2 : 1;
+				else if(inGraphics && strncmp(line,"RenderSunShafts=",16)==0){
+					int q=atoi(line+16); regtaGfxSunShafts=(int8_t)(q<0?0:(q>3?3:q));
+				}
 				else if(inGraphics && strncmp(line, "RenderRTShadows=", 16) == 0)
 					gRTShadows = atoi(line + 16) != 0;
+				else if(inGraphics && strncmp(line, "RenderRTGlass=", 14) == 0)
+					gRTGlass = atoi(line + 14) != 0;
+				else if(inGraphics && strncmp(line, "RenderRTGlassStrength=", 22) == 0)
+					gRTGlassStrength = (float)atof(line + 22);
+				else if(inGraphics && strncmp(line, "RenderRTGI=", 11) == 0)
+					gGI = atoi(line + 11) != 0;
+				else if(inGraphics && strncmp(line, "RenderRTGIStrength=", 19) == 0)
+					gGIStrength = (float)atof(line + 19);
+				else if(inGraphics && strncmp(line, "RenderRTLights=", 15) == 0)
+					gRTLights = atoi(line + 15) != 0;
+				else if(inGraphics && strncmp(line, "RenderRTLightStrength=", 22) == 0)
+					gRTLightStrength = (float)atof(line + 22);
+				else if(inGraphics && strncmp(line, "RenderRTAO=", 11) == 0)
+					gAO = atoi(line + 11) != 0;
+				else if(inGraphics && strncmp(line, "RenderRTAOStrength=", 19) == 0)
+					gAOStrength = (float)atof(line + 19);
 				else if(inGraphics && strncmp(line, "RenderRTShadowStrength=", 23) == 0)
 					gRTShadowStrength = (float)atof(line + 23);
 				else if(inGraphics && strncmp(line, "RenderRTShadowDistance=", 23) == 0)
@@ -3663,6 +4160,8 @@ startGLFW(void)
 		// everything the menu can switch on later needs the offscreen target and its attachments from the start
 		gUseTarget = true;
 		gNeedVel = true;
+		regtaGfxRTResolutionIdx=(int8_t)(rtResolutionIdx>=0 ? rtResolutionIdx : gRTDiv==2 ? 1 : 0);
+		gRTDiv=regtaGfxRTResolutionIdx==2 ? 4 : regtaGfxRTResolutionIdx==1 ? 2 : 1;
 		regtaGfxTemporal = gTemporal; regtaGfxMetalFX = gMetalFX; regtaGfxSSR = gSSR;
 		regtaGfxRT = gRT; regtaGfxRTShadows = gRTShadows; regtaGfxRTRoads = 1;
 		if(!haveScaleIdx){
@@ -3678,7 +4177,7 @@ startGLFW(void)
 	{
 		// re3.ini [Graphics] Retina=1 draws at the screen's native pixels (screen-sized camera textures follow)
 		bool retina = false;
-		if(FILE *ini = fopen("re3.ini", "r")){
+		if(FILE *ini = fopen(gameIniName(), "r")){
 			char line[256];
 			bool inGraphics = false;
 			while(fgets(line, sizeof(line), ini)){
@@ -3852,6 +4351,7 @@ initOpenGL(void)
 	registerBlock("State");
 #endif
 	u_matColor = registerUniform("u_matColor", UNIFORM_VEC4);
+	u_glassRefl = registerUniform("u_glassRefl", UNIFORM_VEC4);
 	u_surfProps = registerUniform("u_surfProps", UNIFORM_VEC4);
 
 	// for im2d
